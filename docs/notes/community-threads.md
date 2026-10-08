@@ -418,6 +418,18 @@ Follow-up `5ff0b8a` added a listing progress count, a complete per-OS local-name
 and reserved names), and a collision check that probes the destination filesystem for case sensitivity. Goes out in
 `mtp-rs-cli` 0.9.0.
 
+### #37: Installing the CLI on macOS without a Rust toolchain (opened 2026-10-07)
+
+Reporter: [@dtretyakov](https://github.com/dtretyakov) (Dmitry Tretyakov, who wrote the CLI in #11). His
+[Monkey C for IntelliJ](https://plugins.jetbrains.com/plugin/34203-monkey-c) plugin (Garmin Connect IQ development)
+finds the watch with `mtp-rs --json devices` and installs apps with `mtp-rs put --verify --replace … /GARMIN/APPS/`, but
+most Connect IQ developers have no Rust, so `cargo install` was where they gave up. He listed four options (tap formula
+built from source, prebuilt binaries plus a formula, dist, homebrew-core at 75 stars; the repo had 46). We picked dist:
+`mtp-rs-cli-v*` tags now build binaries for macOS, Linux, and Windows, publish a GitHub Release with installers, and push
+`Formula/mtp-rs.rb` to `vdavid/homebrew-tap`, so `brew install vdavid/tap/mtp-rs` works. First release:
+`mtp-rs-cli-v0.9.1` on 2026-10-08. Setup details in `docs/releasing.md`. homebrew-core is worth revisiting once the repo
+reaches 75 stars.
+
 ## Device quirks reference
 
 Cross-cutting summary of every quirk currently handled or known. Sorted by device family.
@@ -466,7 +478,7 @@ Cross-cutting summary of every quirk currently handled or known. Sorted by devic
   read-only suite 11/11 (#10).
 - [@dragon-Elec](https://github.com/dragon-Elec): Python bindings request
   (#7).
-- [@dtretyakov](https://github.com/dtretyakov): Dmitry Tretyakov. Contributed the whole CLI (#11).
+- [@dtretyakov](https://github.com/dtretyakov): Dmitry Tretyakov. Contributed the whole CLI (#11). Uses it in his Monkey C for IntelliJ plugin; asked for a Rust-free install (#37).
 - [@qarmin](https://github.com/qarmin): Rafał Mikrut, author of Czkawka/Krokiet. Reported the Samsung
   A15 mid-transfer freeze (#18) with an integration-suite run that pinpointed the cancel path. Reads
   Rust; happy to run patched builds.
