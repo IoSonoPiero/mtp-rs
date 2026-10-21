@@ -14,6 +14,10 @@ Entries are grouped by release. Each entry tags which crate it applies to with *
 
 ## [Unreleased]
 
+### Fixed
+
+- **[lib] The Windows (WPD) backend reports object dates.** `ObjectInfo::created` and `ObjectInfo::modified` were always `None` on Windows, so listings had no dates there while the USB backend had them. They now come from `WPD_OBJECT_DATE_CREATED` and `WPD_OBJECT_DATE_MODIFIED` (`VT_DATE`), as zoneless values like the ones Android writes over USB: on a Xiaomi phone they match the time in the camera's file names. A device that doesn't report a date still yields `None`.
+
 ## [0.33.0] - 2026-10-07
 
 Library `0.33.0`, CLI `0.9.1`. Copies can keep their dates: a windowed download hands back the file's modification time for free, dates say honestly whether they carry a time zone, and the virtual device does dates in both directions, so all of it is testable without a phone.
