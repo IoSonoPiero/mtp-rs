@@ -5,16 +5,43 @@
 //! (`GetStringValue`/`GetGuidValue`/`GetUnsignedLargeIntegerValue`) keep us out of raw `PROPVARIANT`
 //! handling, as proven in the Phase 0 spike.
 
-use crate::mtp::{Error, ObjectFormat, ObjectHandle, ObjectInfo, StorageId};
+use crate::mtp::{DateTime, Error, ObjectFormat, ObjectHandle, ObjectInfo, StorageId, UtcOffset};
 use std::ffi::c_void;
 
 use windows::core::{Error as WinError, GUID, PWSTR};
 use windows::Win32::Devices::PortableDevices::{
     IPortableDeviceProperties, IPortableDeviceValues, WPD_CONTENT_TYPE_FOLDER,
-    WPD_CONTENT_TYPE_FUNCTIONAL_OBJECT, WPD_OBJECT_CONTENT_TYPE, WPD_OBJECT_NAME,
-    WPD_OBJECT_ORIGINAL_FILE_NAME, WPD_OBJECT_SIZE,
+    WPD_CONTENT_TYPE_FUNCTIONAL_OBJECT, WPD_OBJECT_CONTENT_TYPE, WPD_OBJECT_DATE_CREATED,
+    WPD_OBJECT_DATE_MODIFIED, WPD_OBJECT_NAME, WPD_OBJECT_ORIGINAL_FILE_NAME, WPD_OBJECT_SIZE,
 };
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::VT_DATE;
+
+/// Days between the OLE automation epoch (1899-12-30) and the Unix epoch (1970-01-01).
+const OLE_TO_UNIX_DAYS: f64 = 25_569.0;
+
+/// Read a WPD date property (`VT_DATE`: days since 1899-12-30, fraction = time of day) as a
+/// zoneless [`DateTime`], like the zoneless dates the USB backend reads from `ObjectInfo`.
+/// `None` when the device doesn't report it or it isn't a `VT_DATE`.
+///
+/// # Safety
+/// `v` must be a live `IPortableDeviceValues`.
+pub(crate) unsafe fn read_date(v: &IPortableDeviceValues, key: &PROPERTYKEY) -> Option<DateTime> {
+    let pv = v.GetValue(key).ok()?;
+    // VT_DATE holds a plain f64: nothing to free.
+    let inner = &pv.Anonymous.Anonymous;
+    if inner.vt != VT_DATE {
+        return None;
+    }
+    let days = inner.Anonymous.date;
+    if !days.is_finite() || days <= 0.0 {
+        return None;
+    }
+    let secs = ((days - OLE_TO_UNIX_DAYS) * 86_400.0).round() as i64;
+    let d = DateTime::from_unix_seconds(secs, UtcOffset::UTC)?;
+    Some(DateTime { offset: None, ..d })
+}
 
 /// Build a NUL-terminated UTF-16 buffer for a `PCWSTR`/`PWSTR` argument. The returned `Vec` must
 /// outlive the call that borrows its pointer.
@@ -90,8 +117,8 @@ pub(crate) fn is_folder_content_type(ctype: &GUID) -> bool {
 /// of a known directory, all are context we already have — cheaper and more reliable than
 /// re-deriving them from each child's properties. The caller interns `wpd_id` into the shared
 /// [`IdMap`](super::ids::IdMap) under its lock and passes the resulting `handle` here, so this
-/// function never touches the (mutex-guarded) map while doing COM I/O. Datetimes are left `None` for
-/// now (lenient; see the plan's "per-device property variance" risk).
+/// function never touches the (mutex-guarded) map while doing COM I/O. Datetimes come from
+/// `WPD_OBJECT_DATE_CREATED`/`_MODIFIED` and are `None` when the device doesn't report them.
 ///
 /// # Safety
 /// `props` must be a live `IPortableDeviceProperties` for the open device.
@@ -105,8 +132,12 @@ pub(crate) unsafe fn read_object_info(
     let id_w = wide(wpd_id);
     let vals = props.GetValues(windows::core::PCWSTR(id_w.as_ptr()), None);
 
-    let (filename, size, folder) = match vals {
+    let (filename, size, folder, created, modified) = match vals {
         Ok(v) => {
+            let (created, modified) = (
+                read_date(&v, &WPD_OBJECT_DATE_CREATED),
+                read_date(&v, &WPD_OBJECT_DATE_MODIFIED),
+            );
             // Prefer the original filesystem name; fall back to the display name.
             let filename = v
                 .GetStringValue(&WPD_OBJECT_ORIGINAL_FILE_NAME)
@@ -128,9 +159,9 @@ pub(crate) unsafe fn read_object_info(
                 v.GetUnsignedLargeIntegerValue(&WPD_OBJECT_SIZE)
                     .unwrap_or(0)
             };
-            (filename, size, folder)
+            (filename, size, folder, created, modified)
         }
-        Err(_) => (String::new(), 0, false),
+        Err(_) => (String::new(), 0, false, None, None),
     };
 
     let format = if folder {
@@ -146,8 +177,8 @@ pub(crate) unsafe fn read_object_info(
         filename,
         size,
         format,
-        created: None,
-        modified: None,
+        created,
+        modified,
         image_width: 0,
         image_height: 0,
         folder,
