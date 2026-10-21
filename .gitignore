@@ -7,3 +7,5 @@ target/
 .worktrees/
 
 .claude/worktrees
+# Worktree warm-start markers (~/.claude/scripts/new-worktree.sh)
+.warming-worktree*
