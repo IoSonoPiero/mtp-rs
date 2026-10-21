@@ -14,9 +14,13 @@ Entries are grouped by release. Each entry tags which crate it applies to with *
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-10-21
+
+Library `0.33.1` only; the CLI stays at `0.9.1`, since it doesn't print dates. Files listed on Windows have dates now.
+
 ### Fixed
 
-- **[lib] The Windows (WPD) backend reports object dates.** `ObjectInfo::created` and `ObjectInfo::modified` were always `None` on Windows, so listings had no dates there while the USB backend had them. They now come from `WPD_OBJECT_DATE_CREATED` and `WPD_OBJECT_DATE_MODIFIED` (`VT_DATE`), as zoneless values like the ones Android writes over USB: on a Xiaomi phone they match the time in the camera's file names. A device that doesn't report a date still yields `None`.
+- **[lib] The Windows (WPD) backend reports object dates.** `ObjectInfo::created` and `ObjectInfo::modified` were always `None` on Windows, so listings had no dates there while the USB backend had them. They now come from `WPD_OBJECT_DATE_CREATED` and `WPD_OBJECT_DATE_MODIFIED` (`VT_DATE`), as zoneless values like the ones Android writes over USB: on a Xiaomi phone they match the time in the camera's file names. A device that doesn't report a date still yields `None`. `WindowedDownload::modified()` and `created()` pick these up too. Contributed by [@IoSonoPiero](https://github.com/IoSonoPiero) in [#41](https://github.com/vdavid/mtp-rs/pull/41).
 
 ## [0.33.0] - 2026-10-07
 
