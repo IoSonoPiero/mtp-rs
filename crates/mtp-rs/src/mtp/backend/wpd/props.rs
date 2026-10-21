@@ -16,25 +16,36 @@ use windows::Win32::Devices::PortableDevices::{
 };
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Variant::VT_DATE;
 
 /// Days between the OLE automation epoch (1899-12-30) and the Unix epoch (1970-01-01).
 const OLE_TO_UNIX_DAYS: f64 = 25_569.0;
 
-/// Read a WPD date property (`VT_DATE`: days since 1899-12-30, fraction = time of day) as a
-/// zoneless [`DateTime`], like the zoneless dates the USB backend reads from `ObjectInfo`.
-/// `None` when the device doesn't report it or it isn't a `VT_DATE`.
+/// Read a WPD date property (`VT_DATE`) as a zoneless [`DateTime`], like the zoneless dates the
+/// USB backend reads from `ObjectInfo`. `None` when the device doesn't report it or it isn't a
+/// `VT_DATE`.
+///
+/// Zoneless is what the hardware shows, not an assumption: the Windows MTP driver hands the
+/// device's wall-clock time through without converting it. On a Xiaomi POCO X7 Pro (Windows 11,
+/// PR #41) `IMG_20260809_190833.jpg` read back as 19:08:33, where a local↔UTC conversion would
+/// have shifted it by the PC's offset. One device so far, so a phone that reports a different
+/// hour from the USB backend is a reason to revisit this.
 ///
 /// # Safety
 /// `v` must be a live `IPortableDeviceValues`.
 pub(crate) unsafe fn read_date(v: &IPortableDeviceValues, key: &PROPERTYKEY) -> Option<DateTime> {
-    let pv = v.GetValue(key).ok()?;
-    // VT_DATE holds a plain f64: nothing to free.
+    let mut pv = v.GetValue(key).ok()?;
     let inner = &pv.Anonymous.Anonymous;
-    if inner.vt != VT_DATE {
-        return None;
-    }
-    let days = inner.Anonymous.date;
+    let days = (inner.vt == VT_DATE).then(|| inner.Anonymous.date);
+    // A VT_DATE owns nothing, but a device could store any type under the key.
+    let _ = PropVariantClear(&mut pv);
+    ole_date_to_datetime(days?)
+}
+
+/// Convert an OLE automation date (days since 1899-12-30, fraction = time of day) to a zoneless
+/// [`DateTime`]. `None` for 0 (the "no date" value), anything before it, and non-finite input.
+fn ole_date_to_datetime(days: f64) -> Option<DateTime> {
     if !days.is_finite() || days <= 0.0 {
         return None;
     }
@@ -195,4 +206,49 @@ pub(crate) unsafe fn set_u32(
     value: u32,
 ) -> Result<(), Error> {
     bag.SetUnsignedIntegerValue(key, value).map_err(map_hresult)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zoneless(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> Option<DateTime> {
+        DateTime::new(y, mo, d, h, mi, s)
+    }
+
+    #[test]
+    fn ole_date_at_the_unix_epoch() {
+        assert_eq!(
+            ole_date_to_datetime(25_569.0),
+            zoneless(1970, 1, 1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn ole_date_fraction_is_the_time_of_day() {
+        assert_eq!(
+            ole_date_to_datetime(36_585.25),
+            zoneless(2000, 2, 29, 6, 0, 0)
+        );
+    }
+
+    #[test]
+    fn ole_date_rounds_to_the_nearest_second() {
+        // The PR #41 hardware sample: IMG_20260809_190833.jpg. Not exact in f64, so this pins
+        // the rounding too.
+        let days = 46_243.0 + 68_913.0 / 86_400.0;
+        assert_eq!(ole_date_to_datetime(days), zoneless(2026, 8, 9, 19, 8, 33));
+    }
+
+    #[test]
+    fn ole_date_is_zoneless() {
+        assert_eq!(ole_date_to_datetime(46_243.5).unwrap().offset, None);
+    }
+
+    #[test]
+    fn ole_date_zero_negative_and_non_finite_are_no_date() {
+        for days in [0.0, -1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ole_date_to_datetime(days), None, "{days}");
+        }
+    }
 }
