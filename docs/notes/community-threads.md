@@ -4,7 +4,7 @@ Catch-up reading for any agent that picks up issue or PR work, so you don't have
 start. Read this first when triaging a new issue or PR, and update it after work that affects community-facing context
 (see [Updating this doc](#updating-this-doc) at the bottom).
 
-Last updated: 2026-09-23.
+Last updated: 2026-10-21.
 
 ## Intentionally / continuously open threads
 
@@ -430,6 +430,16 @@ built from source, prebuilt binaries plus a formula, dist, homebrew-core at 75 s
 `mtp-rs-cli-v0.9.1` on 2026-10-08. Setup details in `docs/releasing.md`. homebrew-core is worth revisiting once the repo
 reaches 75 stars.
 
+### #41: Object dates on Windows (merged 2026-10-21, shipped in v0.33.1)
+
+Contributor: [@IoSonoPiero](https://github.com/IoSonoPiero) (Pierluigi Montinaro). The WPD backend hard-coded
+`ObjectInfo::created`/`modified` to `None`, so Windows listings had no dates. The PR reads `WPD_OBJECT_DATE_CREATED`
+and `WPD_OBJECT_DATE_MODIFIED` (`VT_DATE`) as zoneless values. Hardware evidence: a Xiaomi POCO X7 Pro on Windows 11,
+where camera files read back at exactly the time in their names, so the Windows MTP driver doesn't convert between
+local time and UTC (the reasoning lives on `read_date` in `mtp::backend::wpd::props`). Green on every CI job, including
+the Windows WPD one, and rebase-merged as-is. Follow-up `84278f0` split out the OLE-date math with unit tests and frees
+the `PROPVARIANT`. Asked whether they'd run the integration suite on the POCO X7 Pro for the tested devices table.
+
 ## Device quirks reference
 
 Cross-cutting summary of every quirk currently handled or known. Sorted by device family.
@@ -496,6 +506,8 @@ Cross-cutting summary of every quirk currently handled or known. Sorted by devic
 - [@ChristianSimonSU](https://github.com/ChristianSimonSU): Montblanc Digital Paper e-Ink report in #6 (2026-09-22).
   Tests on macOS via the CLI, and reports device-side behavior (what the device UI does with uploaded files), not just
   protocol results.
+- [@IoSonoPiero](https://github.com/IoSonoPiero): Pierluigi Montinaro. WPD object dates (#41, 2026-10-21), tested on a
+  Xiaomi POCO X7 Pro under Windows 11, so a possible tester for the WPD backend on hardware we don't have.
 
 ## Updating this doc
 
