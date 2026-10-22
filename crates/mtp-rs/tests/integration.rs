@@ -45,6 +45,19 @@
 //! MTP_TEST_READFILE=/DCIM/111_PANA/P1110001.JPG cargo test --test integration -- --ignored ...
 //! ```
 //!
+//! ## Comparing the two listing paths
+//!
+//! `test_prop_list_listing_matches_per_handle` lists one folder with
+//! `GetObjectPropList` and again with one `GetObjectInfo` per child (two
+//! sessions), checks both agree field by field, and prints both timings. It
+//! reads only. It lists `DCIM/Camera` when there is one, else the writable test
+//! folder; pick another with `MTP_TEST_LIST_FOLDER`, a `/`-separated path from
+//! the storage root:
+//!
+//! ```sh
+//! MTP_TEST_LIST_FOLDER=/Pictures/Screenshots cargo test --test integration prop_list -- --ignored --nocapture
+//! ```
+//!
 //! ## The >4 GiB round trip
 //!
 //! `test_big_file_over_4gib_round_trip` needs a second gate on top of
@@ -466,6 +479,38 @@ async fn find_writable_folder(storage: &Storage) -> Option<(ObjectHandle, String
     None
 }
 
+/// Resolve a `/`-separated folder path from the storage root to its handle.
+async fn resolve_folder(storage: &Storage, path: &str) -> Option<ObjectHandle> {
+    let mut parent = None;
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        let objects = storage.list_objects(parent).await.ok()?;
+        let folder = objects
+            .iter()
+            .find(|o| o.is_folder() && o.filename == segment)?;
+        parent = Some(folder.handle);
+    }
+    parent
+}
+
+/// The folder the prop-list comparison lists: `MTP_TEST_LIST_FOLDER` (a `/`-separated path
+/// from the storage root) if set, else `DCIM/Camera`, else the writable test folder.
+async fn pick_listing_folder(storage: &Storage) -> Option<(ObjectHandle, String)> {
+    if let Ok(path) = std::env::var("MTP_TEST_LIST_FOLDER") {
+        let handle = resolve_folder(storage, &path).await;
+        if handle.is_none() {
+            tlog!(
+                "MTP_TEST_LIST_FOLDER='{}' doesn't resolve to a folder",
+                path
+            );
+        }
+        return handle.map(|h| (h, path));
+    }
+    if let Some(handle) = resolve_folder(storage, "DCIM/Camera").await {
+        return Some((handle, "DCIM/Camera".to_string()));
+    }
+    find_writable_folder(storage).await
+}
+
 /// Read-only tests that don't modify the device.
 mod readonly {
     use super::*;
@@ -552,6 +597,158 @@ mod readonly {
         }
 
         assert!(objects.iter().any(|o| o.is_folder()));
+    }
+
+    /// One session's listing of the comparison folder: the folder's handle in that session,
+    /// what it listed, and how long the listing took.
+    async fn list_folder_once(
+        use_prop_list: bool,
+    ) -> Option<(ObjectHandle, Vec<mtp_rs::ObjectInfo>, Duration)> {
+        let device = MtpDevice::builder()
+            .timeout(crate::test_timeout())
+            .use_object_prop_list(use_prop_list)
+            .open_first()
+            .await
+            .map_err(|e| tlog!("SKIPPING: open device - {:?}", e))
+            .ok()?;
+        let storages = device
+            .storages()
+            .await
+            .map_err(|e| tlog!("SKIPPING: get storages - {:?}", e))
+            .ok()?;
+        let storage = storages.first()?;
+        let Some((folder, path)) = pick_listing_folder(storage).await else {
+            tlog!("SKIPPING: no folder to list (set MTP_TEST_LIST_FOLDER)");
+            return None;
+        };
+        if !use_prop_list {
+            // Asks only GetObjectHandles: warms the device's directory cache, so the timed
+            // listing below isn't charged for the device's first scan of the folder.
+            drop(storage.list_objects_stream(Some(folder)).await);
+        }
+        let started = Instant::now();
+        let objects = storage
+            .list_objects(Some(folder))
+            .await
+            .unwrap_or_else(|e| panic!("listing {path} failed: {e:?}"));
+        let elapsed = started.elapsed();
+        tlog!(
+            "{}: {} objects in {path} in {:.2?}",
+            if use_prop_list {
+                "GetObjectPropList"
+            } else {
+                "per handle"
+            },
+            objects.len(),
+            elapsed
+        );
+        device.close().await.ok();
+        Some((folder, objects, elapsed))
+    }
+
+    /// Lists one folder with and without `GetObjectPropList` and checks both report the
+    /// same objects field by field. Prints both timings. Read-only.
+    ///
+    /// `created` is compared only where the prop-list listing has one: Android serves no
+    /// `DateCreated` in a prop list (its `GetObjectInfo` reports the modified time there), so
+    /// a `None` on that side is reported, not failed. Image dimensions aren't compared, since
+    /// prop-list listings leave them at 0 by design.
+    #[tokio::test]
+    #[ignore]
+    #[serial]
+    async fn test_prop_list_listing_matches_per_handle() {
+        let Some((per_handle_folder, per_handle, slow)) = list_folder_once(false).await else {
+            return;
+        };
+        let Some((prop_list_folder, prop_list, fast)) = list_folder_once(true).await else {
+            return;
+        };
+        tlog!(
+            "Speedup: {:.1}x",
+            slow.as_secs_f64() / fast.as_secs_f64().max(1e-6)
+        );
+
+        let by_name = |objects: &[mtp_rs::ObjectInfo]| {
+            let mut map = std::collections::BTreeMap::new();
+            for o in objects {
+                assert!(
+                    map.insert(o.filename.clone(), o.clone()).is_none(),
+                    "duplicate name {} in one listing",
+                    o.filename
+                );
+            }
+            map
+        };
+        let (a, b) = (by_name(&per_handle), by_name(&prop_list));
+        let only_a: Vec<_> = a.keys().filter(|k| !b.contains_key(*k)).collect();
+        let only_b: Vec<_> = b.keys().filter(|k| !a.contains_key(*k)).collect();
+        assert!(
+            only_a.is_empty() && only_b.is_empty(),
+            "only per handle: {only_a:?}; only prop list: {only_b:?}"
+        );
+
+        let mut differences = Vec::new();
+        let mut created_missing = 0;
+        for (name, x) in &a {
+            let y = &b[name];
+            let mut differ = |field: &str, same: bool, detail: String| {
+                if !same {
+                    differences.push(format!("{name}: {field} {detail}"));
+                }
+            };
+            differ(
+                "size",
+                x.size == y.size,
+                format!("{} vs {}", x.size, y.size),
+            );
+            differ(
+                "format",
+                x.format == y.format,
+                format!("{:?} vs {:?}", x.format, y.format),
+            );
+            differ(
+                "folder",
+                x.is_folder() == y.is_folder(),
+                format!("{} vs {}", x.is_folder(), y.is_folder()),
+            );
+            differ(
+                "parent",
+                x.parent == per_handle_folder && y.parent == prop_list_folder,
+                format!("{:?} vs {:?}", x.parent, y.parent),
+            );
+            differ(
+                "storage",
+                x.storage_id == y.storage_id,
+                format!("{:?} vs {:?}", x.storage_id, y.storage_id),
+            );
+            differ(
+                "modified",
+                x.modified == y.modified,
+                format!("{:?} vs {:?}", x.modified, y.modified),
+            );
+            match (&x.created, &y.created) {
+                (Some(_), None) => created_missing += 1,
+                (x_created, y_created) => differ(
+                    "created",
+                    x_created == y_created,
+                    format!("{x_created:?} vs {y_created:?}"),
+                ),
+            }
+        }
+        if created_missing > 0 {
+            tlog!(
+                "{created_missing} object(s) have a creation date per handle but none via \
+                 GetObjectPropList (expected on Android)"
+            );
+        }
+        for difference in differences.iter().take(20) {
+            tlog!("  DIFF {difference}");
+        }
+        assert!(
+            differences.is_empty(),
+            "{} field difference(s) between the two listings",
+            differences.len()
+        );
     }
 
     /// SLOW: Lists ALL objects recursively. Set MTP_RUN_SLOW_TESTS=1 to run.
