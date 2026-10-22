@@ -2707,11 +2707,66 @@ mod tests {
             let prop_lists = prop_list_requests(serial) - prop_lists;
             let infos = object_info_requests(serial) - infos;
             if use_prop_list {
-                assert_eq!((prop_lists, infos), (1, 0), "one request, no GetObjectInfo");
+                // "All properties", then the DateCreated Android's "all" leaves out.
+                assert_eq!((prop_lists, infos), (2, 0), "no GetObjectInfo");
             } else {
                 assert_eq!((prop_lists, infos), (0, 3), "one GetObjectInfo per child");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn both_listing_paths_agree_field_by_field() {
+        let dir = listing_tree();
+        let off = open_listing_device(dir.path(), "agree-off", false, |_| {}).await;
+        let per_handle = walk(&off).await;
+        assert_eq!(per_handle.len(), 10, "the whole tree");
+        assert!(per_handle
+            .iter()
+            .all(|(_, o)| o.modified.is_some() && o.created.is_some()));
+
+        let device = open_listing_device(dir.path(), "agree-on", true, |_| {}).await;
+        assert_same_listing(&per_handle, &walk(&device).await, "all properties");
+        assert!(prop_list_requests("agree-on") > 0);
+
+        // The device itself not advertising the operation is the same as turning it off.
+        let device = open_listing_device(dir.path(), "agree-unadvertised", true, |c| {
+            c.supports_object_prop_list = false;
+        })
+        .await;
+        assert_same_listing(&per_handle, &walk(&device).await, "unadvertised");
+        assert_eq!(prop_list_requests("agree-unadvertised"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_declined_all_properties_lists_one_property_at_a_time() {
+        let dir = listing_tree();
+        let off = open_listing_device(dir.path(), "decl-all-off", false, |_| {}).await;
+        let per_handle = walk(&off).await;
+
+        let serial = "decl-all-on";
+        let device = open_listing_device(dir.path(), serial, true, |c| {
+            c.prop_list_declines_all = true;
+        })
+        .await;
+        assert_same_listing(&per_handle, &walk(&device).await, "per property");
+        // The root lists per handle either way, so compare with an all-properties walk.
+        let all = open_listing_device(dir.path(), "decl-all-default", true, |_| {}).await;
+        walk(&all).await;
+        assert_eq!(
+            object_info_requests(serial),
+            object_info_requests("decl-all-default"),
+            "no folder below the root fell back to GetObjectInfo"
+        );
+
+        // Asked once, the decline is remembered: the next listing goes straight to six
+        // per-property requests (four required, two dates).
+        let storage = device.storages().await.unwrap().remove(0);
+        let music = storage.list_objects(None).await.unwrap();
+        let music = music.iter().find(|o| o.filename == "Music").unwrap().handle;
+        let before = prop_list_requests(serial);
+        storage.list_objects(Some(music)).await.unwrap();
+        assert_eq!(prop_list_requests(serial) - before, 6);
     }
 
     #[tokio::test]

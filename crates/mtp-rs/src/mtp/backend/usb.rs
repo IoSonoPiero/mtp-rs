@@ -215,7 +215,20 @@ impl UsbBackend {
             match self.ask_prop_list(parent, None).await? {
                 PropListAnswer::Elements(elements) => {
                     match children_from_prop_list(&elements, storage, parent) {
-                        Ok(children) => return Ok(Some(children).filter(|c| !c.is_empty())),
+                        Ok(children) if children.is_empty() => return Ok(None),
+                        Ok(mut children) => {
+                            let answered: Vec<_> = PROP_LIST_OPTIONAL
+                                .into_iter()
+                                .filter(|&p| {
+                                    elements.iter().any(|e| {
+                                        e.property == p && e.handle != parent && e.value.is_some()
+                                    })
+                                })
+                                .collect();
+                            self.add_optional_properties(parent, &mut children, &answered, cancel)
+                                .await?;
+                            return Ok(Some(children));
+                        }
                         Err(_why) => diag_debug!(
                             "GetObjectPropList for all properties: {_why:?}; asking one property \
                              at a time"
@@ -252,7 +265,25 @@ impl UsbBackend {
                 return Ok(None);
             }
         };
+        self.add_optional_properties(parent, &mut children, &[], cancel)
+            .await?;
+        Ok(Some(children))
+    }
 
+    /// Ask for each of [`PROP_LIST_OPTIONAL`] not in `answered` and set it on `children`.
+    ///
+    /// "All properties" isn't all of them everywhere: Android's leaves out `DateCreated`. So a
+    /// date an "all" answer didn't carry is asked on its own, and the per-property mode asks
+    /// both. A decline, or an answer that gives no child a value (Android answers
+    /// `DateCreated` as `Undefined` for every object), is remembered for the session, so it
+    /// costs one request per session rather than one per listing.
+    async fn add_optional_properties(
+        &self,
+        parent: PtpHandle,
+        children: &mut [PtpObjectInfo],
+        answered: &[ObjectPropertyCode],
+        cancel: Option<&CancelToken>,
+    ) -> Result<(), PtpError> {
         let index: HashMap<PtpHandle, usize> = children
             .iter()
             .enumerate()
@@ -260,30 +291,36 @@ impl UsbBackend {
             .collect();
         for (bit, property) in PROP_LIST_OPTIONAL.into_iter().enumerate() {
             let bit = 1 << bit;
-            if self.prop_list_declined_optional.load(Ordering::Relaxed) & bit != 0 {
+            if answered.contains(&property)
+                || self.prop_list_declined_optional.load(Ordering::Relaxed) & bit != 0
+            {
                 continue;
             }
             bail_if_cancelled(cancel)?;
-            match self.ask_prop_list(parent, Some(property)).await? {
+            let served = match self.ask_prop_list(parent, Some(property)).await? {
                 // Objects that arrived since the required answers aren't in `index`; they show
                 // up in the next listing. Only the asked property is taken, so an answer can't
                 // overwrite a required one that was already checked.
                 PropListAnswer::Elements(answer) => {
+                    let mut served = false;
                     for element in answer.into_iter().filter(|e| e.property == property) {
                         if let (Some(&i), Some(value)) =
                             (index.get(&element.handle), &element.value)
                         {
-                            children[i].set_property(element.property, value);
+                            served |= children[i].set_property(element.property, value);
                         }
                     }
+                    served
                 }
-                PropListAnswer::Declined | PropListAnswer::Unparseable => {
-                    self.prop_list_declined_optional
-                        .fetch_or(bit, Ordering::Relaxed);
-                }
+                PropListAnswer::Declined | PropListAnswer::Unparseable => false,
+            };
+            if !served {
+                diag_debug!("GetObjectPropList serves no {property:?}; not asking again");
+                self.prop_list_declined_optional
+                    .fetch_or(bit, Ordering::Relaxed);
             }
         }
-        Ok(Some(children))
+        Ok(())
     }
 
     fn prop_list_mode(&self) -> PropListMode {
@@ -1453,6 +1490,9 @@ mod tests {
             (11, 0xDC04, 0x0008, pack_u64(OVER_4GIB).to_vec()),
             (11, 0xDC0B, 0x0006, pack_u32(5).to_vec()),
         ]);
+        // The answer has no dates, so each is asked on its own.
+        device.decline();
+        device.decline();
 
         let backend = mock_backend_with_prop_list(transport).await;
         let objs = list_folder(&backend, None).await.unwrap();
@@ -1470,10 +1510,14 @@ mod tests {
             objs.iter().all(|o| o.storage_id == SID),
             "a StorageId the answer left out is the listed storage"
         );
-        // One request for all properties of the children, and no GetObjectInfo.
+        // One request for all properties of the children, then the dates, and no GetObjectInfo.
         assert_eq!(
             command_params(&mock, OperationCode::GetObjectPropList),
-            [vec![5, 0, 0xFFFF_FFFF, 0, 1]]
+            [
+                vec![5, 0, 0xFFFF_FFFF, 0, 1],
+                vec![5, 0, u32::from(MODIFIED), 0, 1],
+                vec![5, 0, u32::from(CREATED), 0, 1],
+            ]
         );
         assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
     }
@@ -1685,6 +1729,91 @@ mod tests {
         expected.extend(per_property_requests(&PER_PROPERTY[..5]));
         assert_eq!(prop_list_requests(&mock), expected);
         assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
+    }
+
+    /// `property` with data type `Undefined` and no value for the folder and each child: how
+    /// Android answers a property it doesn't serve, such as `DateCreated`.
+    fn undefined_answer(property: u16, children: &[(u32, &str)]) -> Vec<Element> {
+        std::iter::once(FOLDER)
+            .chain(children.iter().map(|&(handle, _)| handle))
+            .map(|handle| (handle, property, 0x0000, Vec::new()))
+            .collect()
+    }
+
+    /// An "all properties" answer without `left_out`.
+    fn all_answer_without(left_out: u16, children: &[(u32, &str)]) -> Vec<Element> {
+        let mut elements = all_answer(children);
+        elements.retain(|e| e.1 != left_out);
+        elements
+    }
+
+    #[tokio::test]
+    async fn a_date_an_all_answer_left_out_is_asked_for_on_its_own() {
+        let (transport, mock) = mock_transport();
+        let mut device = Answers::new(&mock);
+        let children = [(11, "a.jpg")];
+        for _ in 0..2 {
+            device.prop_list(&all_answer_without(CREATED, &children));
+            device.prop_list(&answer(CREATED, &children));
+        }
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        for _ in 0..2 {
+            let objs = list_folder(&backend, None).await.unwrap();
+            assert_eq!(names(&objs), ["a.jpg"]);
+            assert!(objs[0].modified.is_some());
+            assert!(
+                objs[0].created.is_some(),
+                "the date the device serves on its own"
+            );
+        }
+        let ask = [0xFFFF_FFFF, u32::from(CREATED)];
+        assert_eq!(prop_list_requests(&mock), [ask, ask].concat());
+        assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_date_the_device_serves_for_nothing_is_not_asked_again() {
+        // Android: "all" has no DateCreated, and asked alone it comes back Undefined.
+        let (transport, mock) = mock_transport();
+        let mut device = Answers::new(&mock);
+        let children = [(11, "a.jpg")];
+        device.prop_list(&all_answer_without(CREATED, &children));
+        device.prop_list(&undefined_answer(CREATED, &children));
+        device.prop_list(&all_answer_without(CREATED, &children));
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        for _ in 0..2 {
+            let objs = list_folder(&backend, None).await.unwrap();
+            assert_eq!(names(&objs), ["a.jpg"]);
+            assert!(objs[0].modified.is_some());
+            assert_eq!(objs[0].created, None);
+        }
+        assert_eq!(
+            prop_list_requests(&mock),
+            [0xFFFF_FFFF, u32::from(CREATED), 0xFFFF_FFFF]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_date_served_for_nothing_per_property_is_not_asked_again() {
+        let (transport, mock) = mock_transport();
+        let mut device = Answers::new(&mock);
+        let children = [(11, "a.jpg")];
+        device.decline();
+        device.per_property(&PER_PROPERTY[..5], &children);
+        device.prop_list(&undefined_answer(CREATED, &children));
+        device.per_property(&PER_PROPERTY[..5], &children);
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        for _ in 0..2 {
+            let objs = list_folder(&backend, None).await.unwrap();
+            assert_eq!(objs[0].created, None);
+        }
+        let mut expected = vec![0xFFFF_FFFF];
+        expected.extend(per_property_requests(&PER_PROPERTY));
+        expected.extend(per_property_requests(&PER_PROPERTY[..5]));
+        assert_eq!(prop_list_requests(&mock), expected);
     }
 
     #[tokio::test]
