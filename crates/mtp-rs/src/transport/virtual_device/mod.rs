@@ -2792,6 +2792,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_folder_handle_does_not_turn_the_fast_path_off() {
+        let dir = listing_tree();
+        let serial = "prop-list-rekey";
+        let device = open_listing_device(dir.path(), serial, true, |_| {}).await;
+        let storage = device.storages().await.unwrap().remove(0);
+        let find = |objects: Vec<crate::mtp::ObjectInfo>, name: &str| {
+            objects
+                .into_iter()
+                .find(|o| o.filename == name)
+                .unwrap()
+                .handle
+        };
+        let dcim = find(storage.list_objects(None).await.unwrap(), "DCIM");
+        let stale = find(storage.list_objects(Some(dcim)).await.unwrap(), "Camera");
+
+        // Android re-keys handles after a media rescan: the cached handle is now unknown.
+        super::registry::rekey_virtual_object(serial, std::path::Path::new("DCIM/Camera")).unwrap();
+        let listed = storage.list_objects(Some(stale)).await;
+        assert!(
+            listed.as_ref().map_or(true, Vec::is_empty),
+            "a stale handle lists nothing: {listed:?}"
+        );
+
+        // Re-listing the parent finds the new handle, and that listing is still one
+        // "all properties" request (plus DateCreated), not the per-property mode.
+        let fresh = find(storage.list_objects(Some(dcim)).await.unwrap(), "Camera");
+        assert_ne!(fresh, stale);
+        let (prop_lists, infos) = (prop_list_requests(serial), object_info_requests(serial));
+        assert_eq!(storage.list_objects(Some(fresh)).await.unwrap().len(), 3);
+        assert_eq!(
+            (
+                prop_list_requests(serial) - prop_lists,
+                object_info_requests(serial) - infos
+            ),
+            (2, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn an_undescribable_object_in_a_folder_is_skipped_on_the_prop_list_path_too() {
         let dir = listing_tree();
         let serial = "prop-list-22";
