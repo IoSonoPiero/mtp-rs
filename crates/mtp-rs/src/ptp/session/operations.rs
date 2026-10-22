@@ -4,9 +4,8 @@
 //! listing storage and objects, downloading/uploading files, etc.
 
 use crate::ptp::{
-    pack_string, unpack_u32, unpack_u32_array, unpack_u64, DeviceInfo, EventContainer,
-    ObjectFormatCode, ObjectHandle, ObjectInfo, ObjectPropertyCode, OperationCode, StorageId,
-    StorageInfo,
+    pack_string, unpack_u32_array, unpack_u64, DeviceInfo, EventContainer, ObjectFormatCode,
+    ObjectHandle, ObjectInfo, ObjectPropertyCode, OperationCode, StorageId, StorageInfo,
 };
 use crate::PtpError as Error;
 
@@ -326,78 +325,44 @@ impl PtpSession {
         Ok(data)
     }
 
-    /// The children of `parent` with the properties `ObjectInfo` needs, in a few transactions
-    /// instead of one `GetObjectInfo` per child.
+    /// Get object property list.
     ///
-    /// Issues `GetObjectPropList` (MTP 0x9805) with depth 1, which asks for the object *and* its
-    /// direct children (Android's `MtpDatabase` returns both), so the parent itself is filtered
-    /// out here. With `all`, every property (`0xFFFFFFFF`) in one roundtrip; if the device declines
-    /// that, or without `all`, once per property (callers that saw "all" declined skip it next time
-    /// with `all = false`). A Xiaomi POCO X7 Pro (HyperOS 3, Android 16) answers "all" with
-    /// `InvalidObjectPropCode` (0xA801) in most folders but serves each property alone: a
-    /// 797-object folder then takes about 180 ms in 8 requests, against 3.8 s of `GetObjectInfo`.
+    /// Retrieves property values of `handle` and, with a nonzero `depth`, of the objects below
+    /// it, in one transaction. This is an MTP extension operation (0x9805).
     ///
-    /// Sizes come from the 64-bit `ObjectSize` property, so files over 4 GB need no extra lookup.
+    /// # Arguments
     ///
-    /// Returns the objects and whether "all" was answered.
-    pub async fn get_object_prop_list_children(
+    /// * `handle` - The object to start from, or `ObjectHandle::ALL` for every object
+    /// * `format` - Only objects of this format, or `None` for all formats
+    /// * `property` - One property, or `None` for all of them (`0xFFFFFFFF`). A property code
+    ///   of `0` (`ObjectPropertyCode::Unknown(0)`) asks the device to select by `group`
+    /// * `group` - The property group code; only read when the property code is `0`
+    /// * `depth` - `0` for `handle` alone, `1` to add its direct children, and so on
+    ///   (`0xFFFFFFFF` for all levels). A device may decline a depth it doesn't support
+    ///
+    /// # Returns
+    ///
+    /// Returns the raw dataset; parse it with [`ObjectPropListElement::list_from_bytes`]. An
+    /// answer for `depth > 0` may include `handle` itself, so a caller after the children alone
+    /// should filter it out by handle.
+    ///
+    /// [`ObjectPropListElement::list_from_bytes`]: crate::ptp::ObjectPropListElement::list_from_bytes
+    pub async fn get_object_prop_list(
         &self,
-        parent: ObjectHandle,
-        all: bool,
-    ) -> Result<(Vec<ObjectInfo>, bool), Error> {
-        let answered = match all {
-            true => match self.get_object_prop_list(parent, 0xFFFF_FFFF).await {
-                Ok(data) => Some(data),
-                // Declined: ask one property at a time.
-                Err(Error::Protocol { .. }) => None,
-                Err(e) => return Err(e),
-            },
-            false => None,
-        };
-        let all_answered = answered.is_some();
-        let data = match answered {
-            Some(data) => data,
-            None => {
-                // One dataset per property, merged into one: the counts add up, the elements follow
-                // one another.
-                let mut count = 0u32;
-                let mut elements = Vec::new();
-                for property in [
-                    ObjectPropertyCode::StorageId,
-                    ObjectPropertyCode::ObjectFormat,
-                    ObjectPropertyCode::ProtectionStatus,
-                    ObjectPropertyCode::ObjectSize,
-                    ObjectPropertyCode::ObjectFileName,
-                    ObjectPropertyCode::DateCreated,
-                    ObjectPropertyCode::DateModified,
-                    ObjectPropertyCode::ParentObject,
-                ] {
-                    let data = self
-                        .get_object_prop_list(parent, u32::from(u16::from(property)))
-                        .await?;
-                    count += unpack_u32(&data)?;
-                    elements.extend_from_slice(&data[4..]);
-                }
-                let mut data = count.to_le_bytes().to_vec();
-                data.extend(elements);
-                data
-            }
-        };
-        let mut objects = ObjectInfo::list_from_prop_list(&data)?;
-        objects.retain(|o| o.handle != parent);
-        Ok((objects, all_answered))
-    }
-
-    /// `GetObjectPropList` for one property (or `0xFFFFFFFF` for all) of `parent` and its children.
-    async fn get_object_prop_list(
-        &self,
-        parent: ObjectHandle,
-        property: u32,
+        handle: ObjectHandle,
+        format: Option<ObjectFormatCode>,
+        property: Option<ObjectPropertyCode>,
+        group: u32,
+        depth: u32,
     ) -> Result<Vec<u8>, Error> {
+        let format_code = format.map(|f| u32::from(u16::from(f))).unwrap_or(0);
+        let property_code = property
+            .map(|p| u32::from(u16::from(p)))
+            .unwrap_or(0xFFFF_FFFF);
         let (response, data) = self
             .execute_with_receive(
                 OperationCode::GetObjectPropList,
-                &[parent.0, 0, property, 0, 1],
+                &[handle.0, format_code, property_code, group, depth],
             )
             .await?;
         Self::check_response(&response, OperationCode::GetObjectPropList)?;

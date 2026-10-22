@@ -19,14 +19,17 @@ use crate::mtp::{
     UploadError,
 };
 use crate::ptp::{
-    DeviceInfo as PtpDeviceInfo, ObjectHandle as PtpHandle, OperationCode, PtpSession,
-    ReceiveStream, ResponseCode, StorageId as PtpStorageId,
+    DeviceInfo as PtpDeviceInfo, ObjectHandle as PtpHandle, ObjectInfo as PtpObjectInfo,
+    ObjectPropListElement, ObjectPropertyCode, OperationCode, PtpSession, ReceiveStream,
+    ResponseCode, StorageId as PtpStorageId,
 };
 use crate::PtpError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,12 +84,12 @@ pub(crate) struct UsbBackend {
     /// ranged/windowed read path (see [`plan_partial_read`]).
     has_partial_object_64: bool,
     has_partial_object: bool,
-    /// Whether the device advertises `GetObjectPropList`: folder listings then take one
-    /// roundtrip instead of one `GetObjectInfo` per child.
+    /// Whether the device advertises `GetObjectPropList`, which lets a folder listing skip the
+    /// per-child `GetObjectInfo` (see [`UsbBackend::list_by_prop_list`]).
     has_object_prop_list: bool,
-    /// Cleared once the device declines `GetObjectPropList` for all properties: later listings
-    /// ask one property at a time straight away.
-    prop_list_all: std::sync::atomic::AtomicBool,
+    /// Cleared once the device declines `GetObjectPropList` for all properties at once: later
+    /// listings ask one property at a time straight away.
+    prop_list_all: AtomicBool,
 }
 
 impl UsbBackend {
@@ -104,7 +107,7 @@ impl UsbBackend {
             has_partial_object_64,
             has_partial_object,
             has_object_prop_list,
-            prop_list_all: std::sync::atomic::AtomicBool::new(true),
+            prop_list_all: AtomicBool::new(true),
         }
     }
 
@@ -171,6 +174,113 @@ impl UsbBackend {
             Err(e) => Err(e),
         }
     }
+
+    /// List `parent`'s children with `GetObjectPropList` (depth 1) instead of one `GetObjectInfo`
+    /// per child, or `Ok(None)` when the device declined, so the caller lists per handle.
+    ///
+    /// First every property in one request; once the device declines that, one request per
+    /// property in [`PROP_LIST_PROPERTIES`] from then on. Sizes come from the 64-bit `ObjectSize`
+    /// property, so files over 4 GB need no extra lookup.
+    async fn list_by_prop_list(
+        &self,
+        parent: PtpHandle,
+    ) -> Result<Option<Vec<PtpObjectInfo>>, PtpError> {
+        let mut elements = None;
+        if self.prop_list_all.load(Ordering::Relaxed) {
+            match self.ask_prop_list(parent, None).await? {
+                PropListAnswer::Elements(answer) => elements = Some(answer),
+                PropListAnswer::Declined => self.prop_list_all.store(false, Ordering::Relaxed),
+                PropListAnswer::Unparseable => return Ok(None),
+            }
+        }
+        let elements = match elements {
+            Some(elements) => elements,
+            None => {
+                let mut elements = Vec::new();
+                for property in PROP_LIST_PROPERTIES {
+                    match self.ask_prop_list(parent, Some(property)).await? {
+                        PropListAnswer::Elements(answer) => elements.extend(answer),
+                        PropListAnswer::Declined | PropListAnswer::Unparseable => return Ok(None),
+                    }
+                }
+                elements
+            }
+        };
+        let mut objects = objects_from_prop_list(&elements);
+        objects.retain(|o| o.handle != parent && o.parent == parent);
+        Ok(Some(objects))
+    }
+
+    /// One `GetObjectPropList` request for `parent` and its children: `property`, or every
+    /// property with `None`.
+    ///
+    /// Only a *decline* (see [`is_all_handle_rejection`]) and a dataset we can't parse come back
+    /// as answers; everything else is the session or the transport failing, and propagates.
+    async fn ask_prop_list(
+        &self,
+        parent: PtpHandle,
+        property: Option<ObjectPropertyCode>,
+    ) -> Result<PropListAnswer, PtpError> {
+        match self
+            .session
+            .get_object_prop_list(parent, None, property, 0, 1)
+            .await
+        {
+            Ok(data) => Ok(match ObjectPropListElement::list_from_bytes(&data) {
+                Ok(elements) => PropListAnswer::Elements(elements),
+                Err(_e) => {
+                    diag_debug!("GetObjectPropList {property:?}: unparseable dataset ({_e})");
+                    PropListAnswer::Unparseable
+                }
+            }),
+            Err(e) if is_all_handle_rejection(&e) => {
+                diag_debug!("GetObjectPropList {property:?} declined ({e})");
+                Ok(PropListAnswer::Declined)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The properties a per-property `GetObjectPropList` listing asks for, one request each.
+const PROP_LIST_PROPERTIES: [ObjectPropertyCode; 8] = [
+    ObjectPropertyCode::StorageId,
+    ObjectPropertyCode::ObjectFormat,
+    ObjectPropertyCode::ProtectionStatus,
+    ObjectPropertyCode::ObjectSize,
+    ObjectPropertyCode::ObjectFileName,
+    ObjectPropertyCode::DateCreated,
+    ObjectPropertyCode::DateModified,
+    ObjectPropertyCode::ParentObject,
+];
+
+/// What one `GetObjectPropList` request came to, short of a failing session.
+enum PropListAnswer {
+    Elements(Vec<ObjectPropListElement>),
+    /// The device answered with a response code (or a STALL): it won't serve this request.
+    Declined,
+    /// The transaction completed, so the session is fine, but the dataset doesn't parse.
+    Unparseable,
+}
+
+/// Fold `GetObjectPropList` elements into one `ObjectInfo` per handle, in first-seen order (an
+/// object's elements are usually adjacent, but the spec doesn't promise it).
+fn objects_from_prop_list(elements: &[ObjectPropListElement]) -> Vec<PtpObjectInfo> {
+    let mut objects: Vec<PtpObjectInfo> = Vec::new();
+    let mut index = HashMap::new();
+    for element in elements {
+        let i = *index.entry(element.handle).or_insert_with(|| {
+            objects.push(PtpObjectInfo {
+                handle: element.handle,
+                ..PtpObjectInfo::default()
+            });
+            objects.len() - 1
+        });
+        if let Some(value) = &element.value {
+            objects[i].set_property(element.property, value);
+        }
+    }
+    objects
 }
 
 /// Did the device *decline* `GetObjectHandles(parent=0xFFFFFFFF)`, as opposed to
@@ -325,42 +435,19 @@ impl MtpBackend for UsbBackend {
     ) -> Result<BackendListing, Error> {
         bail_if_cancelled(cancel)?;
 
-        // A folder in one roundtrip when the device can. Root listings keep the per-handle path
-        // and its quirk handling (they are short anyway). Only a *decline* falls back, as for
-        // the root-listing fast path (`is_all_handle_rejection`), plus a dataset we couldn't
-        // parse (the transaction completed, so the session is fine): a sick session must not be
-        // hit again with one `GetObjectInfo` per child.
-        if let (Some(parent), true) = (parent, self.has_object_prop_list) {
-            let all = self
-                .prop_list_all
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let r = self
-                .session
-                .get_object_prop_list_children(parent.to_ptp(), all)
-                .await;
-            match r {
-                Ok((infos, all_answered)) => {
-                    if all && !all_answered {
-                        self.prop_list_all
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let objects: Vec<_> = infos
-                        .into_iter()
-                        .filter(|i| i.parent == parent.to_ptp())
-                        .map(|i| Ok(ObjectInfo::from_ptp(i)))
-                        .collect();
-                    return Ok(BackendListing {
-                        total: objects.len(),
-                        items: Box::pin(futures::stream::iter(objects)),
-                    });
-                }
-                Err(e)
-                    if is_all_handle_rejection(&e) || matches!(e, PtpError::InvalidData { .. }) =>
-                {
-                    diag_debug!("GetObjectPropList declined ({e}); listing per handle");
-                }
-                Err(e) => return Err(e.into()),
+        // Root listings keep the per-handle path and its quirk handling (they're short anyway).
+        if let Some(parent) = parent.filter(|_| self.has_object_prop_list) {
+            if let Some(objects) = self.list_by_prop_list(parent.to_ptp()).await? {
+                let objects: Vec<_> = objects
+                    .into_iter()
+                    .map(|info| Ok(ObjectInfo::from_ptp(info)))
+                    .collect();
+                return Ok(BackendListing {
+                    total: objects.len(),
+                    items: Box::pin(futures::stream::iter(objects)),
+                });
             }
+            diag_debug!("GetObjectPropList unusable for {parent:?}; listing per handle");
         }
 
         let (handles, filter) = self

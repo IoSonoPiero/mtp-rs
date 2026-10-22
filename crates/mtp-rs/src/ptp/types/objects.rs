@@ -2,12 +2,13 @@
 //!
 //! This module contains the [`ObjectInfo`] structure for file/folder metadata.
 
+use super::properties::PropertyValue;
 use super::storage::{AssociationType, ProtectionStatus};
 use crate::ptp::pack::{
     pack_datetime, pack_string, pack_u16, pack_u32, unpack_datetime, unpack_string, unpack_u16,
     unpack_u32, DateTime,
 };
-use crate::ptp::{ObjectFormatCode, ObjectHandle, StorageId};
+use crate::ptp::{ObjectFormatCode, ObjectHandle, ObjectPropertyCode, PropertyDataType, StorageId};
 
 // --- ObjectInfo Structure ---
 
@@ -255,94 +256,46 @@ impl ObjectInfo {
         Ok(buf)
     }
 
-    /// Parse the dataset of `GetObjectPropList` (MTP 0x9805) into one `ObjectInfo` per object, in
-    /// the order the objects first appear.
+    /// Set the field `property` maps to, from a `GetObjectPropList` value (see
+    /// [`ObjectPropListElement`]).
     ///
-    /// The dataset is a count followed by `(handle, property code, data type, value)` quadruples
-    /// (MTP 1.1 E.2.1.1). Only the properties `ObjectInfo` has a field for are kept; the others are
-    /// skipped by their data type. Fields the device didn't send keep their defaults, so callers
-    /// should ask for all properties (`0xFFFFFFFF`).
-    ///
-    /// Errors on a truncated dataset or an element type it can't size, so a caller can fall back
-    /// to `GetObjectInfo` per handle.
-    pub fn list_from_prop_list(buf: &[u8]) -> Result<Vec<Self>, crate::PtpError> {
-        use crate::ptp::{ObjectPropertyCode as P, PropertyDataType, PropertyValue};
+    /// Returns whether it did: `false` for a property `ObjectInfo` has no field for, or a value
+    /// whose type doesn't fit the field (a string where a number belongs, or a number too wide
+    /// for it). Integer properties take any unsigned width that fits, since devices don't all
+    /// send the spec's type. An unparseable date string still sets the date, to `None`, the
+    /// same leniency as [`ObjectInfo::from_bytes`].
+    pub fn set_property(&mut self, property: ObjectPropertyCode, value: &PropertyValue) -> bool {
+        use ObjectPropertyCode as P;
 
-        let count = unpack_u32(buf)? as usize;
-        let mut offset = 4;
-        let mut objects: Vec<ObjectInfo> = Vec::new();
-        // Index into `objects` by handle: the elements of one object are usually adjacent, but
-        // the spec doesn't promise it.
-        let mut index = std::collections::HashMap::new();
-        for _ in 0..count {
-            let rest = buf.get(offset..).unwrap_or_default();
-            let handle = ObjectHandle(unpack_u32(rest)?);
-            let code = P::from(unpack_u16(rest.get(4..).unwrap_or_default())?);
-            let type_code = unpack_u16(rest.get(6..).unwrap_or_default())?;
-            offset += 8;
-            let rest = buf.get(offset..).unwrap_or_default();
-            let i = *index.entry(handle).or_insert_with(|| {
-                objects.push(ObjectInfo {
-                    handle,
-                    ..ObjectInfo::default()
-                });
-                objects.len() - 1
-            });
-            let info = &mut objects[i];
-            // Arrays (0x4001..=0x400A): a u32 count, then that many elements of the base type.
-            if (0x4001..=0x400A).contains(&type_code) {
-                let base = PropertyDataType::from(type_code & 0x00FF);
-                let size = base.byte_size().ok_or_else(|| {
-                    crate::PtpError::invalid_data(format!(
-                        "unsupported array type {type_code:#06x}"
-                    ))
-                })?;
-                let len = 4 + unpack_u32(rest)? as usize * size;
-                if rest.len() < len {
-                    return Err(crate::PtpError::invalid_data("truncated array property"));
-                }
-                offset += len;
-                continue;
+        if let PropertyValue::String(s) = value {
+            match property {
+                P::ObjectFileName => self.filename = s.clone(),
+                P::DateCreated => self.created = DateTime::parse(s),
+                P::DateModified => self.modified = DateTime::parse(s),
+                _ => return false,
             }
-            let data_type = PropertyDataType::from(type_code);
-            match data_type {
-                PropertyDataType::Int128 | PropertyDataType::Uint128 => {
-                    if rest.len() < 16 {
-                        return Err(crate::PtpError::invalid_data("truncated 128-bit property"));
-                    }
-                    offset += 16;
-                    continue;
-                }
-                // No value at all: the POCO X7 Pro sends DateCreated this way when it has none.
-                PropertyDataType::Undefined => continue,
-                _ => {}
-            }
-            let (value, consumed) = PropertyValue::from_bytes(rest, data_type)?;
-            offset += consumed;
-            let num = |v: &PropertyValue| match *v {
-                PropertyValue::Uint8(x) => Some(u64::from(x)),
-                PropertyValue::Uint16(x) => Some(u64::from(x)),
-                PropertyValue::Uint32(x) => Some(u64::from(x)),
-                PropertyValue::Uint64(x) => Some(x),
-                _ => None,
-            };
-            match (code, &value) {
-                (P::StorageId, v) => info.storage_id = StorageId(num(v).unwrap_or(0) as u32),
-                (P::ObjectFormat, v) => {
-                    info.format = ObjectFormatCode::from(num(v).unwrap_or(0) as u16)
-                }
-                (P::ProtectionStatus, v) => {
-                    info.protection_status = ProtectionStatus::from(num(v).unwrap_or(0) as u16);
-                }
-                (P::ObjectSize, v) => info.size = num(v).unwrap_or(0),
-                (P::ParentObject, v) => info.parent = ObjectHandle(num(v).unwrap_or(0) as u32),
-                (P::ObjectFileName, PropertyValue::String(s)) => info.filename = s.clone(),
-                (P::DateCreated, PropertyValue::String(s)) => info.created = DateTime::parse(s),
-                (P::DateModified, PropertyValue::String(s)) => info.modified = DateTime::parse(s),
-                _ => {}
-            }
+            return true;
         }
-        Ok(objects)
+        let n = match *value {
+            PropertyValue::Uint8(n) => u64::from(n),
+            PropertyValue::Uint16(n) => u64::from(n),
+            PropertyValue::Uint32(n) => u64::from(n),
+            PropertyValue::Uint64(n) => n,
+            _ => return false,
+        };
+        match property {
+            P::ObjectSize => self.size = n,
+            P::StorageId if n <= u64::from(u32::MAX) => self.storage_id = StorageId(n as u32),
+            P::ParentObject if n <= u64::from(u32::MAX) => self.parent = ObjectHandle(n as u32),
+            P::ObjectFormat if n <= u64::from(u16::MAX) => {
+                self.format = ObjectFormatCode::from(n as u16);
+            }
+            P::ProtectionStatus if n <= u64::from(u16::MAX) => {
+                self.protection_status = ProtectionStatus::from(n as u16);
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Check if this object is a folder.
@@ -360,6 +313,83 @@ impl ObjectInfo {
     #[must_use]
     pub fn is_file(&self) -> bool {
         !self.is_folder()
+    }
+}
+
+// --- GetObjectPropList dataset ---
+
+/// One element of a `GetObjectPropList` dataset (MTP 1.1 E.2.1.1): one property of one object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectPropListElement {
+    /// The object the property belongs to.
+    pub handle: ObjectHandle,
+    /// Which property this is.
+    pub property: ObjectPropertyCode,
+    /// The data type the device declared for the value.
+    pub data_type: PropertyDataType,
+    /// The value, or `None` when there's none this library decodes: data type `Undefined` (no
+    /// value bytes at all), an array, or a 128-bit integer. The parser steps over those by size.
+    pub value: Option<PropertyValue>,
+}
+
+impl ObjectPropListElement {
+    /// Parse a whole `GetObjectPropList` dataset: a `u32` element count, then that many
+    /// `(handle, property code, data type, value)` elements, kept in the device's order.
+    ///
+    /// Errors on a truncated dataset or on a data type it can't size (and so can't step over).
+    /// Apply the elements to [`ObjectInfo`]s with [`ObjectInfo::set_property`].
+    pub fn list_from_bytes(buf: &[u8]) -> Result<Vec<Self>, crate::PtpError> {
+        let count = unpack_u32(buf)?;
+        let mut offset = 4;
+        // No preallocation from `count`: a corrupt count would ask for gigabytes.
+        let mut elements = Vec::new();
+        for _ in 0..count {
+            let rest = buf.get(offset..).unwrap_or_default();
+            let handle = ObjectHandle(unpack_u32(rest)?);
+            let property = ObjectPropertyCode::from(unpack_u16(rest.get(4..).unwrap_or_default())?);
+            let type_code = unpack_u16(rest.get(6..).unwrap_or_default())?;
+            offset += 8;
+            let rest = buf.get(offset..).unwrap_or_default();
+            let data_type = PropertyDataType::from(type_code);
+
+            let (value, consumed) = if (0x4001..=0x400A).contains(&type_code) {
+                // Arrays: a u32 count, then that many elements of the base type.
+                let size = PropertyDataType::from(type_code & 0x00FF)
+                    .byte_size()
+                    .ok_or_else(|| {
+                        crate::PtpError::invalid_data(format!(
+                            "unsupported array type {type_code:#06x}"
+                        ))
+                    })?;
+                let len = (unpack_u32(rest)? as usize)
+                    .checked_mul(size)
+                    .and_then(|n| n.checked_add(4))
+                    .ok_or_else(|| crate::PtpError::invalid_data("array property too long"))?;
+                (None, len)
+            } else {
+                match data_type {
+                    PropertyDataType::Int128 | PropertyDataType::Uint128 => (None, 16),
+                    PropertyDataType::Undefined => (None, 0),
+                    _ => {
+                        let (value, consumed) = PropertyValue::from_bytes(rest, data_type)?;
+                        (Some(value), consumed)
+                    }
+                }
+            };
+            if rest.len() < consumed {
+                return Err(crate::PtpError::invalid_data(format!(
+                    "truncated {data_type:?} property {property:?}"
+                )));
+            }
+            offset += consumed;
+            elements.push(ObjectPropListElement {
+                handle,
+                property,
+                data_type,
+                value,
+            });
+        }
+        Ok(elements)
     }
 }
 
@@ -387,6 +417,27 @@ mod tests {
         buf
     }
 
+    /// Apply every element to one `ObjectInfo` per handle, in first-seen order.
+    fn objects(elements: &[ObjectPropListElement]) -> Vec<ObjectInfo> {
+        let mut out: Vec<ObjectInfo> = Vec::new();
+        for e in elements {
+            let i = match out.iter().position(|o| o.handle == e.handle) {
+                Some(i) => i,
+                None => {
+                    out.push(ObjectInfo {
+                        handle: e.handle,
+                        ..ObjectInfo::default()
+                    });
+                    out.len() - 1
+                }
+            };
+            if let Some(value) = &e.value {
+                out[i].set_property(e.property, value);
+            }
+        }
+        out
+    }
+
     #[test]
     fn prop_list_builds_one_object_per_handle() {
         let size = u64::from(u32::MAX) + 10;
@@ -403,7 +454,9 @@ mod tests {
             element(7, 0xDC03, 0x0004, &pack_u16(0)),
             element(9, 0xDC0B, 0x0006, &pack_u32(3)),
         ]);
-        let objects = ObjectInfo::list_from_prop_list(&buf).unwrap();
+        let elements = ObjectPropListElement::list_from_bytes(&buf).unwrap();
+        assert_eq!(elements.len(), 10, "the device's order, one element each");
+        let objects = objects(&elements);
         assert_eq!(objects.len(), 2);
         let file = &objects[0];
         assert_eq!(file.handle, ObjectHandle(7));
@@ -419,17 +472,21 @@ mod tests {
     }
 
     #[test]
-    fn prop_list_skips_what_it_does_not_keep() {
+    fn prop_list_skips_what_it_does_not_decode() {
         let buf = dataset(&[
             // An array (AUINT16: count, then the elements) and a 128-bit value: skipped by size.
             element(7, 0xDC86, 0x4004, &[2, 0, 0, 0, 1, 0, 2, 0]),
             element(7, 0xDC41, 0x000A, &[0xAB; 16]),
-            // No value at all (data type 0): a POCO X7 Pro sends DateCreated this way.
+            // No value at all (data type 0), which is how some devices answer a property they
+            // don't keep.
             element(7, 0xDC08, 0x0000, &[]),
             element(7, 0xDC07, 0xFFFF, &pack_string("a.mp4")),
         ]);
-        let objects = ObjectInfo::list_from_prop_list(&buf).unwrap();
-        assert_eq!(objects.len(), 1);
+        let elements = ObjectPropListElement::list_from_bytes(&buf).unwrap();
+        assert_eq!(elements.len(), 4);
+        assert!(elements[..3].iter().all(|e| e.value.is_none()));
+        assert_eq!(elements[2].data_type, PropertyDataType::Undefined);
+        let objects = objects(&elements);
         assert_eq!(objects[0].filename, "a.mp4");
         assert_eq!(objects[0].created, None);
     }
@@ -438,11 +495,41 @@ mod tests {
     fn prop_list_rejects_a_truncated_dataset() {
         let mut buf = dataset(&[element(7, 0xDC07, 0xFFFF, &pack_string("a.jpg"))]);
         buf.truncate(buf.len() - 3);
-        assert!(ObjectInfo::list_from_prop_list(&buf).is_err());
+        assert!(ObjectPropListElement::list_from_bytes(&buf).is_err());
         // More elements announced than present.
         let mut buf = dataset(&[element(7, 0xDC04, 0x0008, &7u64.to_le_bytes())]);
         buf[0] = 2;
-        assert!(ObjectInfo::list_from_prop_list(&buf).is_err());
+        assert!(ObjectPropListElement::list_from_bytes(&buf).is_err());
+        // A 128-bit value cut short.
+        let buf = dataset(&[element(7, 0xDC41, 0x000A, &[0xAB; 15])]);
+        assert!(ObjectPropListElement::list_from_bytes(&buf).is_err());
+        // A data type nobody can size.
+        let buf = dataset(&[element(7, 0xDC07, 0x0042, &[0; 8])]);
+        assert!(ObjectPropListElement::list_from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn set_property_reports_whether_the_value_fit() {
+        let mut info = ObjectInfo::default();
+        assert!(info.set_property(ObjectPropertyCode::ObjectSize, &PropertyValue::Uint32(42)));
+        assert_eq!(info.size, 42, "any unsigned width that fits");
+        // A string where a number belongs, or a number too wide for the field.
+        assert!(!info.set_property(
+            ObjectPropertyCode::ParentObject,
+            &PropertyValue::String("3".into())
+        ));
+        assert!(!info.set_property(
+            ObjectPropertyCode::ParentObject,
+            &PropertyValue::Uint64(u64::from(u32::MAX) + 1)
+        ));
+        assert!(!info.set_property(
+            ObjectPropertyCode::ObjectFileName,
+            &PropertyValue::Uint32(7)
+        ));
+        // A property ObjectInfo has no field for.
+        assert!(!info.set_property(ObjectPropertyCode::Name, &PropertyValue::String("x".into())));
+        assert_eq!(info.parent, ObjectHandle::default());
+        assert_eq!(info.filename, "");
     }
 
     // --- ObjectInfo Tests ---
