@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 30)]
     pub timeout: u64,
 
+    /// List folders with one GetObjectInfo per object instead of GetObjectPropList.
+    /// Slower on devices that support GetObjectPropList (Android); use it when a
+    /// listing looks wrong, or to compare the two.
+    #[arg(long, global = true)]
+    pub no_prop_list: bool,
+
     /// Emit machine-readable JSON where supported.
     #[arg(long, global = true)]
     pub json: bool,

@@ -61,6 +61,7 @@ mtp-rs doctor
 | `--storage INDEX_OR_ID` | Select a storage by zero-based index or storage ID. |
 | `--known VID:PID` | Include a non-standard MTP device in discovery. Can be repeated. |
 | `--timeout SECONDS` | Set the USB transfer timeout. Defaults to 30 seconds. |
+| `--no-prop-list` | List folders with one `GetObjectInfo` per object instead of one `GetObjectPropList` request per folder. Slower on devices that support `GetObjectPropList` (modern Android), and the same elsewhere. Use it when a listing looks wrong (missing objects, wrong sizes or dates), or to compare the two. |
 | `--json` | Emit machine-readable JSON for every command. Transfer progress still goes to stderr. |
 | `--verbose` | Include lower-level protocol or transport error detail. |
 | `--trace` | Print device-protocol diagnostics to stderr (the cancel/reset path, session recovery), for bug reports. Equivalent to `RUST_LOG=mtp_rs=debug`; a set `RUST_LOG` takes precedence, so `RUST_LOG=mtp_rs=trace` adds per-operation detail. |

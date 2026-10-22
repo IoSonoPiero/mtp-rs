@@ -292,6 +292,38 @@ fn get_folder_reports_objects_the_device_will_not_describe() {
 }
 
 #[test]
+fn no_prop_list_lists_folders_per_handle_with_the_same_result() {
+    let fixture = CliFixture::new();
+    let docs = fixture.backing_dir.join("Docs");
+    std::fs::create_dir_all(docs.join("Sub")).unwrap();
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(docs.join(name), b"x").unwrap();
+    }
+
+    // Per-operation trace lines name each operation the CLI sent.
+    let ls = |extra: &[&str]| {
+        let mut command = fixture.command();
+        command.env("RUST_LOG", "mtp_rs=trace");
+        let output = command
+            .args(["--json", "--device", SERIAL])
+            .args(extra)
+            .args(["ls", "/Docs"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (value, stderr.contains("GetObjectPropList"))
+    };
+
+    let (fast, used_prop_list) = ls(&[]);
+    assert!(used_prop_list, "the virtual device advertises it");
+    let (slow, used_prop_list) = ls(&["--no-prop-list"]);
+    assert!(!used_prop_list);
+    assert_eq!(fast, slow);
+}
+
+#[test]
 fn doctor_probe_cancel_finds_a_file_below_the_storage_root() {
     let fixture = CliFixture::new();
     // An Android MTP root holds only directories, so the probe has to look

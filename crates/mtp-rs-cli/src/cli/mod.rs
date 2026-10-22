@@ -146,6 +146,7 @@ mod tests {
             storage: None,
             known: Vec::new(),
             timeout: 30,
+            no_prop_list: false,
             json,
             verbose: false,
             trace: false,

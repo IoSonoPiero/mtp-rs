@@ -43,19 +43,22 @@ pub async fn open_storage(cli: &Cli, mutating: bool) -> Result<(MtpDevice, Stora
 }
 
 pub async fn open_selected_device(cli: &Cli) -> Result<MtpDevice, CliError> {
-    let builder = MtpDevice::builder()
-        .known_devices(&cli.known)
-        .timeout(Duration::from_secs(cli.timeout));
+    let builder = || {
+        MtpDevice::builder()
+            .known_devices(&cli.known)
+            .timeout(Duration::from_secs(cli.timeout))
+            .use_object_prop_list(!cli.no_prop_list)
+    };
 
     if let Some(serial) = &cli.device {
-        return builder
+        return builder()
             .open_by_serial(serial)
             .await
             .map_err(|e| CliError::from_mtp("open device", e, cli.verbose));
     }
 
     if let Some(location) = cli.location {
-        return builder
+        return builder()
             .open_by_location(location)
             .await
             .map_err(|e| CliError::from_mtp("open device", e, cli.verbose));
@@ -65,9 +68,7 @@ pub async fn open_selected_device(cli: &Cli) -> Result<MtpDevice, CliError> {
         .map_err(|e| CliError::from_mtp("list devices", e, cli.verbose))?;
     match devices.as_slice() {
         [] => Err(CliError::new(CliErrorKind::NoDevice, "no MTP device found")),
-        [device] => MtpDevice::builder()
-            .known_devices(&cli.known)
-            .timeout(Duration::from_secs(cli.timeout))
+        [device] => builder()
             .open_by_location(device.location_id)
             .await
             .map_err(|e| CliError::from_mtp("open device", e, cli.verbose)),
