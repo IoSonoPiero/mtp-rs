@@ -23,6 +23,10 @@ Entries are grouped by release. Each entry tags which crate it applies to with *
   - New low-level API: `PtpSession::get_object_prop_list`, `ptp::ObjectPropListElement::list_from_bytes`, and `ptp::ObjectInfo::set_property`. The Windows (WPD) backend is unchanged.
 - **[lib] The virtual device serves `GetObjectPropList`, modeled on Android**, so tests of a consumer's own code exercise the fast listing path by default. New `VirtualDeviceConfig` fields: `supports_object_prop_list` (default `true`), `prop_list_declines_all`, and `prop_list_declined_properties`.
 
+### Fixed
+
+- **[lib] The virtual device refuses a stale folder handle instead of listing it as empty.** Listing a folder by a handle the device no longer knows (for example after `rekey_virtual_object`) returned an empty folder; it now fails with `Error::StaleHandle`, like Android does (`InvalidObjectHandle`), so tests of a consumer's stale-handle recovery see what a phone would send.
+
 ### Added
 
 - **[cli] `--no-prop-list` lists folders one object at a time**, for a device whose listings look wrong, or to compare the two.
