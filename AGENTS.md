@@ -111,6 +111,14 @@ range, window_size)` (returns `WindowedDownload`), and buffered `Storage::downlo
   binary created a root folder, uploaded a root file, verified it, and deleted both. So the old "Android can't create in
   the storage root" line in these docs was describing this bug, not Android.
 - **Android**: Object handles are NOT stable. MediaProvider re-keys object IDs across a media rescan, so a handle a host cached when it last listed a folder can be silently invalidated before a later operation (upload, delete) into that folder: the device then returns `InvalidObjectHandle`/`InvalidParentObject`, not for a missing object but for a stale ID. Hosts should treat those codes on a previously-valid handle as "re-list the parent and re-resolve, then retry once", not as a hard not-found. (A downstream, Cmdr, hit this as a 307 MB upload failing at `SendObjectInfo` and surfacing as "Path not found" on the intact *source* file.) Reproducible against the virtual device with `rekey_virtual_object` (see Testing).
+- **Folder listings use `GetObjectPropList` when advertised** (`UsbBackend::list`, non-root only). Depth 1 returns
+  the folder itself too (Android's `MtpDatabase` does), so `get_object_prop_list_children` drops it. A Xiaomi POCO X7
+  Pro (HyperOS 3) declines "all properties" (`0xFFFFFFFF`) with `InvalidObjectPropCode` (0xA801) in most folders but
+  answers each property alone, and sends a missing `DateCreated` with data type 0 and no value; after one decline the
+  backend asks per property for the rest of the session (`prop_list_all`). Only a decline (`Protocol`/`Io`, as for the
+  root fast path) or an unparseable dataset falls back to `GetObjectInfo` per handle: a sick session must not be hit
+  again with one request per child. Hardware-verified on that phone (Linux/nusb, 2026-10-22): 1,938 objects, fields
+  identical to `GetObjectInfo`, 0.67 s against 7.3 s.
 - **Fujifilm cameras**: Report `AccessCapability::ReadWrite` but return `StoreReadOnly` on writes. Advertised ops lie.
 - **Samsung**: Returns `InvalidObjectHandle` for root listing; needs recursive traversal with filtering
 - **Panasonic Lumix DMC-TZ61** (and likely other PTP cameras): Reports `20480000T000000` (month 0, day 0) as "no date" in ObjectInfo datetimes. Receive-side datetime parsing is lenient for this reason: unparseable datetimes become `None` instead of failing the dataset parse. Send-side packing stays strict.

@@ -81,6 +81,12 @@ pub(crate) struct UsbBackend {
     /// ranged/windowed read path (see [`plan_partial_read`]).
     has_partial_object_64: bool,
     has_partial_object: bool,
+    /// Whether the device advertises `GetObjectPropList`: folder listings then take one
+    /// roundtrip instead of one `GetObjectInfo` per child.
+    has_object_prop_list: bool,
+    /// Cleared once the device declines `GetObjectPropList` for all properties: later listings
+    /// ask one property at a time straight away.
+    prop_list_all: std::sync::atomic::AtomicBool,
 }
 
 impl UsbBackend {
@@ -90,12 +96,15 @@ impl UsbBackend {
         let capabilities = Capabilities::from_ptp_device_info(&ptp_info);
         let has_partial_object_64 = ptp_info.supports_operation(OperationCode::GetPartialObject64);
         let has_partial_object = ptp_info.supports_operation(OperationCode::GetPartialObject);
+        let has_object_prop_list = ptp_info.supports_operation(OperationCode::GetObjectPropList);
         Self {
             session,
             device_info,
             capabilities,
             has_partial_object_64,
             has_partial_object,
+            has_object_prop_list,
+            prop_list_all: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -315,6 +324,44 @@ impl MtpBackend for UsbBackend {
         cancel: Option<&CancelToken>,
     ) -> Result<BackendListing, Error> {
         bail_if_cancelled(cancel)?;
+
+        // A folder in one roundtrip when the device can. Root listings keep the per-handle path
+        // and its quirk handling (they are short anyway). Only a *decline* falls back, as for
+        // the root-listing fast path (`is_all_handle_rejection`), plus a dataset we couldn't
+        // parse (the transaction completed, so the session is fine): a sick session must not be
+        // hit again with one `GetObjectInfo` per child.
+        if let (Some(parent), true) = (parent, self.has_object_prop_list) {
+            let all = self
+                .prop_list_all
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let r = self
+                .session
+                .get_object_prop_list_children(parent.to_ptp(), all)
+                .await;
+            match r {
+                Ok((infos, all_answered)) => {
+                    if all && !all_answered {
+                        self.prop_list_all
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let objects: Vec<_> = infos
+                        .into_iter()
+                        .filter(|i| i.parent == parent.to_ptp())
+                        .map(|i| Ok(ObjectInfo::from_ptp(i)))
+                        .collect();
+                    return Ok(BackendListing {
+                        total: objects.len(),
+                        items: Box::pin(futures::stream::iter(objects)),
+                    });
+                }
+                Err(e)
+                    if is_all_handle_rejection(&e) || matches!(e, PtpError::InvalidData { .. }) =>
+                {
+                    diag_debug!("GetObjectPropList declined ({e}); listing per handle");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         let (handles, filter) = self
             .resolve_listing(storage.to_ptp(), parent.map(ObjectHandle::to_ptp), cancel)
@@ -937,6 +984,133 @@ mod tests {
     }
 
     const SID: StorageId = StorageId(1);
+
+    /// A backend whose device advertises `GetObjectPropList`.
+    async fn mock_backend_with_prop_list(
+        transport: Arc<dyn crate::transport::Transport>,
+    ) -> UsbBackend {
+        let session = Arc::new(PtpSession::open(transport, 1).await.unwrap());
+        let ptp_info = PtpDeviceInfo {
+            operations_supported: vec![OperationCode::GetObjectPropList],
+            ..PtpDeviceInfo::default()
+        };
+        UsbBackend::new(session, ptp_info)
+    }
+
+    /// A `GetObjectPropList` dataset of `(handle, property, data type, value)` elements.
+    fn prop_list(elements: &[(u32, u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = pack_u32(elements.len() as u32).to_vec();
+        for (handle, property, data_type, value) in elements {
+            buf.extend_from_slice(&pack_u32(*handle));
+            buf.extend_from_slice(&pack_u16(*property));
+            buf.extend_from_slice(&pack_u16(*data_type));
+            buf.extend_from_slice(value);
+        }
+        buf
+    }
+
+    fn queue_prop_list(mock: &MockTransport, tx_id: u32, elements: &[(u32, u16, u16, Vec<u8>)]) {
+        mock.queue_response(data_container(
+            tx_id,
+            OperationCode::GetObjectPropList,
+            &prop_list(elements),
+        ));
+        mock.queue_response(ok_response(tx_id));
+    }
+
+    #[tokio::test]
+    async fn list_subfolder_uses_object_prop_list_when_advertised() {
+        let (transport, mock) = mock_transport();
+        mock.queue_response(ok_response(0));
+        let s = |v: &str| crate::ptp::pack_string(v);
+        // Depth 1 answers the folder itself (handle 5) and its children.
+        queue_prop_list(
+            &mock,
+            1,
+            &[
+                (5, 0xDC07, 0xFFFF, s("DCIM")),
+                (5, 0xDC0B, 0x0006, pack_u32(0).to_vec()),
+                (10, 0xDC07, 0xFFFF, s("Camera")),
+                (10, 0xDC02, 0x0004, pack_u16(0x3001).to_vec()),
+                (10, 0xDC0B, 0x0006, pack_u32(5).to_vec()),
+                (11, 0xDC07, 0xFFFF, s("big.mp4")),
+                (11, 0xDC04, 0x0008, pack_u64(OVER_4GIB).to_vec()),
+                (11, 0xDC0B, 0x0006, pack_u32(5).to_vec()),
+            ],
+        );
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        let objs = collect(
+            backend
+                .list(SID, Some(ObjectHandle(5)), None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = objs.iter().map(|o| o.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Camera", "big.mp4"],
+            "the parent itself is left out"
+        );
+        assert!(objs[0].is_folder());
+        assert_eq!(objs[1].size, OVER_4GIB);
+        // One request for all properties of the children, and no GetObjectInfo.
+        assert_eq!(
+            command_params(&mock, OperationCode::GetObjectPropList),
+            [vec![5, 0, 0xFFFF_FFFF, 0, 1]]
+        );
+        assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_prop_list_declined_for_all_asks_one_property_at_a_time() {
+        let (transport, mock) = mock_transport();
+        mock.queue_response(ok_response(0));
+        let s = |v: &str| crate::ptp::pack_string(v);
+        let one_property = |mock: &MockTransport, mut tx: u32| {
+            // StorageId, ObjectFormat, ProtectionStatus, ObjectSize, ObjectFileName,
+            // DateCreated, DateModified, ParentObject: only two answered with values.
+            for property in [
+                0xDC01u16, 0xDC02, 0xDC03, 0xDC04, 0xDC07, 0xDC08, 0xDC09, 0xDC0B,
+            ] {
+                let elements = match property {
+                    0xDC07 => vec![(12, property, 0xFFFF, s("a.jpg"))],
+                    0xDC0B => vec![(12, property, 0x0006, pack_u32(5).to_vec())],
+                    _ => vec![],
+                };
+                queue_prop_list(mock, tx, &elements);
+                tx += 1;
+            }
+        };
+        // First listing: "all" declined (InvalidObjectPropCode), then the eight properties.
+        mock.queue_response(response_with_params(1, ResponseCode::from(0xA801), &[]));
+        one_property(&mock, 2);
+        // Second listing: straight to the properties.
+        one_property(&mock, 10);
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        for _ in 0..2 {
+            let objs = collect(
+                backend
+                    .list(SID, Some(ObjectHandle(5)), None)
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let names: Vec<_> = objs.iter().map(|o| o.filename.as_str()).collect();
+            assert_eq!(names, ["a.jpg"]);
+        }
+        let requests = command_params(&mock, OperationCode::GetObjectPropList);
+        assert_eq!(requests.len(), 1 + 8 + 8);
+        assert_eq!(requests[0][2], 0xFFFF_FFFF);
+        assert!(
+            requests[1..].iter().all(|p| p[2] != 0xFFFF_FFFF),
+            "\"all\" is asked once"
+        );
+    }
 
     // -- Root listing fast-path / filtering --------------------------------------
 

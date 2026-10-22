@@ -255,6 +255,96 @@ impl ObjectInfo {
         Ok(buf)
     }
 
+    /// Parse the dataset of `GetObjectPropList` (MTP 0x9805) into one `ObjectInfo` per object, in
+    /// the order the objects first appear.
+    ///
+    /// The dataset is a count followed by `(handle, property code, data type, value)` quadruples
+    /// (MTP 1.1 E.2.1.1). Only the properties `ObjectInfo` has a field for are kept; the others are
+    /// skipped by their data type. Fields the device didn't send keep their defaults, so callers
+    /// should ask for all properties (`0xFFFFFFFF`).
+    ///
+    /// Errors on a truncated dataset or an element type it can't size, so a caller can fall back
+    /// to `GetObjectInfo` per handle.
+    pub fn list_from_prop_list(buf: &[u8]) -> Result<Vec<Self>, crate::PtpError> {
+        use crate::ptp::{ObjectPropertyCode as P, PropertyDataType, PropertyValue};
+
+        let count = unpack_u32(buf)? as usize;
+        let mut offset = 4;
+        let mut objects: Vec<ObjectInfo> = Vec::new();
+        // Index into `objects` by handle: the elements of one object are usually adjacent, but
+        // the spec doesn't promise it.
+        let mut index = std::collections::HashMap::new();
+        for _ in 0..count {
+            let rest = buf.get(offset..).unwrap_or_default();
+            let handle = ObjectHandle(unpack_u32(rest)?);
+            let code = P::from(unpack_u16(rest.get(4..).unwrap_or_default())?);
+            let type_code = unpack_u16(rest.get(6..).unwrap_or_default())?;
+            offset += 8;
+            let rest = buf.get(offset..).unwrap_or_default();
+            let i = *index.entry(handle).or_insert_with(|| {
+                objects.push(ObjectInfo {
+                    handle,
+                    ..ObjectInfo::default()
+                });
+                objects.len() - 1
+            });
+            let info = &mut objects[i];
+            // Arrays (0x4001..=0x400A): a u32 count, then that many elements of the base type.
+            if (0x4001..=0x400A).contains(&type_code) {
+                let base = PropertyDataType::from(type_code & 0x00FF);
+                let size = base.byte_size().ok_or_else(|| {
+                    crate::PtpError::invalid_data(format!(
+                        "unsupported array type {type_code:#06x}"
+                    ))
+                })?;
+                let len = 4 + unpack_u32(rest)? as usize * size;
+                if rest.len() < len {
+                    return Err(crate::PtpError::invalid_data("truncated array property"));
+                }
+                offset += len;
+                continue;
+            }
+            let data_type = PropertyDataType::from(type_code);
+            match data_type {
+                PropertyDataType::Int128 | PropertyDataType::Uint128 => {
+                    if rest.len() < 16 {
+                        return Err(crate::PtpError::invalid_data("truncated 128-bit property"));
+                    }
+                    offset += 16;
+                    continue;
+                }
+                // No value at all: the POCO X7 Pro sends DateCreated this way when it has none.
+                PropertyDataType::Undefined => continue,
+                _ => {}
+            }
+            let (value, consumed) = PropertyValue::from_bytes(rest, data_type)?;
+            offset += consumed;
+            let num = |v: &PropertyValue| match *v {
+                PropertyValue::Uint8(x) => Some(u64::from(x)),
+                PropertyValue::Uint16(x) => Some(u64::from(x)),
+                PropertyValue::Uint32(x) => Some(u64::from(x)),
+                PropertyValue::Uint64(x) => Some(x),
+                _ => None,
+            };
+            match (code, &value) {
+                (P::StorageId, v) => info.storage_id = StorageId(num(v).unwrap_or(0) as u32),
+                (P::ObjectFormat, v) => {
+                    info.format = ObjectFormatCode::from(num(v).unwrap_or(0) as u16)
+                }
+                (P::ProtectionStatus, v) => {
+                    info.protection_status = ProtectionStatus::from(num(v).unwrap_or(0) as u16);
+                }
+                (P::ObjectSize, v) => info.size = num(v).unwrap_or(0),
+                (P::ParentObject, v) => info.parent = ObjectHandle(num(v).unwrap_or(0) as u32),
+                (P::ObjectFileName, PropertyValue::String(s)) => info.filename = s.clone(),
+                (P::DateCreated, PropertyValue::String(s)) => info.created = DateTime::parse(s),
+                (P::DateModified, PropertyValue::String(s)) => info.modified = DateTime::parse(s),
+                _ => {}
+            }
+        }
+        Ok(objects)
+    }
+
     /// Check if this object is a folder.
     ///
     /// Returns true if the format is Association or the association type is GenericFolder.
@@ -277,6 +367,83 @@ impl ObjectInfo {
 mod tests {
     use super::*;
     use crate::ptp::pack::{pack_datetime, pack_string, pack_u16, pack_u32, DateTime};
+
+    // --- GetObjectPropList dataset ---
+
+    /// One `(handle, property, data type, value)` element of a `GetObjectPropList` dataset.
+    fn element(handle: u32, property: u16, data_type: u16, value: &[u8]) -> Vec<u8> {
+        let mut buf = pack_u32(handle).to_vec();
+        buf.extend_from_slice(&pack_u16(property));
+        buf.extend_from_slice(&pack_u16(data_type));
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    fn dataset(elements: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = pack_u32(elements.len() as u32).to_vec();
+        for e in elements {
+            buf.extend_from_slice(e);
+        }
+        buf
+    }
+
+    #[test]
+    fn prop_list_builds_one_object_per_handle() {
+        let size = u64::from(u32::MAX) + 10;
+        let buf = dataset(&[
+            element(7, 0xDC07, 0xFFFF, &pack_string("IMG_1.jpg")),
+            element(7, 0xDC02, 0x0004, &pack_u16(0x3801)),
+            element(7, 0xDC04, 0x0008, &size.to_le_bytes()),
+            element(7, 0xDC0B, 0x0006, &pack_u32(3)),
+            element(7, 0xDC01, 0x0006, &pack_u32(0x0001_0001)),
+            element(7, 0xDC09, 0xFFFF, &pack_string("20260809T190833")),
+            // Elements of another object in between: grouped by handle, first-seen order.
+            element(9, 0xDC07, 0xFFFF, &pack_string("Camera")),
+            element(9, 0xDC02, 0x0004, &pack_u16(0x3001)),
+            element(7, 0xDC03, 0x0004, &pack_u16(0)),
+            element(9, 0xDC0B, 0x0006, &pack_u32(3)),
+        ]);
+        let objects = ObjectInfo::list_from_prop_list(&buf).unwrap();
+        assert_eq!(objects.len(), 2);
+        let file = &objects[0];
+        assert_eq!(file.handle, ObjectHandle(7));
+        assert_eq!(file.filename, "IMG_1.jpg");
+        assert_eq!(file.format, ObjectFormatCode::Jpeg);
+        assert_eq!(file.size, size, "the 64-bit ObjectSize, no saturation");
+        assert_eq!(file.parent, ObjectHandle(3));
+        assert_eq!(file.storage_id, StorageId(0x0001_0001));
+        assert_eq!(file.modified, DateTime::parse("20260809T190833"));
+        assert!(file.is_file());
+        assert_eq!(objects[1].filename, "Camera");
+        assert!(objects[1].is_folder());
+    }
+
+    #[test]
+    fn prop_list_skips_what_it_does_not_keep() {
+        let buf = dataset(&[
+            // An array (AUINT16: count, then the elements) and a 128-bit value: skipped by size.
+            element(7, 0xDC86, 0x4004, &[2, 0, 0, 0, 1, 0, 2, 0]),
+            element(7, 0xDC41, 0x000A, &[0xAB; 16]),
+            // No value at all (data type 0): a POCO X7 Pro sends DateCreated this way.
+            element(7, 0xDC08, 0x0000, &[]),
+            element(7, 0xDC07, 0xFFFF, &pack_string("a.mp4")),
+        ]);
+        let objects = ObjectInfo::list_from_prop_list(&buf).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].filename, "a.mp4");
+        assert_eq!(objects[0].created, None);
+    }
+
+    #[test]
+    fn prop_list_rejects_a_truncated_dataset() {
+        let mut buf = dataset(&[element(7, 0xDC07, 0xFFFF, &pack_string("a.jpg"))]);
+        buf.truncate(buf.len() - 3);
+        assert!(ObjectInfo::list_from_prop_list(&buf).is_err());
+        // More elements announced than present.
+        let mut buf = dataset(&[element(7, 0xDC04, 0x0008, &7u64.to_le_bytes())]);
+        buf[0] = 2;
+        assert!(ObjectInfo::list_from_prop_list(&buf).is_err());
+    }
 
     // --- ObjectInfo Tests ---
 
