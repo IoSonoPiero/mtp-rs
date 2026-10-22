@@ -84,8 +84,9 @@ pub(crate) struct UsbBackend {
     /// ranged/windowed read path (see [`plan_partial_read`]).
     has_partial_object_64: bool,
     has_partial_object: bool,
-    /// Whether the device advertises `GetObjectPropList`, which lets a folder listing skip the
-    /// per-child `GetObjectInfo` (see [`UsbBackend::list_by_prop_list`]).
+    /// Whether the device advertises `GetObjectPropList` and the consumer didn't turn it off,
+    /// which lets a folder listing skip the per-child `GetObjectInfo` (see
+    /// [`UsbBackend::list_by_prop_list`]).
     has_object_prop_list: bool,
     /// A [`PropListMode`]: how `GetObjectPropList` listings go on this session.
     prop_list_mode: AtomicU8,
@@ -96,12 +97,22 @@ pub(crate) struct UsbBackend {
 
 impl UsbBackend {
     /// Build the backend from an open session, deriving neutral info/capabilities once.
-    pub(crate) fn new(session: Arc<PtpSession>, ptp_info: PtpDeviceInfo) -> Self {
+    ///
+    /// `use_object_prop_list: false` keeps every listing on the per-handle path, whatever the
+    /// device advertises (see [`MtpDeviceBuilder::use_object_prop_list`]).
+    ///
+    /// [`MtpDeviceBuilder::use_object_prop_list`]: crate::mtp::MtpDeviceBuilder::use_object_prop_list
+    pub(crate) fn new(
+        session: Arc<PtpSession>,
+        ptp_info: PtpDeviceInfo,
+        use_object_prop_list: bool,
+    ) -> Self {
         let device_info = DeviceInfo::from_ptp(&ptp_info);
         let capabilities = Capabilities::from_ptp_device_info(&ptp_info);
         let has_partial_object_64 = ptp_info.supports_operation(OperationCode::GetPartialObject64);
         let has_partial_object = ptp_info.supports_operation(OperationCode::GetPartialObject);
-        let has_object_prop_list = ptp_info.supports_operation(OperationCode::GetObjectPropList);
+        let has_object_prop_list =
+            use_object_prop_list && ptp_info.supports_operation(OperationCode::GetObjectPropList);
         Self {
             session,
             device_info,
@@ -1148,7 +1159,7 @@ mod tests {
             vendor_extension_desc: vendor_extension_desc.to_string(),
             ..PtpDeviceInfo::default()
         };
-        UsbBackend::new(session, ptp_info)
+        UsbBackend::new(session, ptp_info, true)
     }
 
     fn object_info_bytes(filename: &str, parent: u32) -> Vec<u8> {
@@ -1291,7 +1302,7 @@ mod tests {
             operations_supported: vec![OperationCode::GetObjectPropList],
             ..PtpDeviceInfo::default()
         };
-        UsbBackend::new(session, ptp_info)
+        UsbBackend::new(session, ptp_info, true)
     }
 
     /// A `GetObjectPropList` dataset of `(handle, property, data type, value)` elements.

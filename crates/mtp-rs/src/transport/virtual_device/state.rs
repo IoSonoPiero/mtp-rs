@@ -114,6 +114,9 @@ pub(super) struct VirtualDeviceState {
     /// way twice. Set via
     /// [`force_object_info_error`](super::registry::force_object_info_error).
     pub(super) forced_object_info_errors: HashMap<u32, u16>,
+    /// How many times each operation code was dispatched, so a test can tell
+    /// which listing path a host took. Read via `registry::operation_count`.
+    pub(super) operation_counts: HashMap<u16, u32>,
 }
 
 /// Maximum number of entries in [`VirtualDeviceState::dropped_paths`]; oldest
@@ -166,6 +169,7 @@ impl VirtualDeviceState {
             pending_cancel_wedge: false,
             pending_operation_wedge: false,
             forced_object_info_errors: HashMap::new(),
+            operation_counts: HashMap::new(),
         }
     }
 

@@ -40,6 +40,7 @@ pub(super) fn dispatch(
     data_payload: Option<&[u8]>,
 ) {
     let op = OperationCode::from(op_code);
+    *state.operation_counts.entry(op_code).or_default() += 1;
 
     match op {
         OperationCode::GetDeviceInfo => handle_get_device_info(state, op_code, tx_id),
@@ -261,7 +262,6 @@ fn handle_get_object_info(
     params: &[u32],
 ) {
     let handle = ObjectHandle(params.first().copied().unwrap_or(0));
-
     if let Some(code) = description_refusal(state, handle) {
         state
             .response_queue
