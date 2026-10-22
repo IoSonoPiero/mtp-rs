@@ -69,6 +69,8 @@ Read it before merging or closing a Renovate PR.
     downstream consumers such as Cmdr.
 - **`serial_test`** (dev-dependency): held below 4. The 4.x line needs Rust 1.93.1 and brings only a `syn` 3 bump.
   Lift the hold when the MSRV reaches 1.93.1.
+- **`proptest`** (dev-dependency): held below 1.12, which needs Rust 1.88 (it sat in the non-major group PR #40,
+  failing only the `rust 1.85` jobs, from 2026-10-19). Lift the hold when the MSRV reaches 1.88.
 - **`actions/checkout`**: majors are safe here. The v7 breaking change blocks checking out fork PR code under
   `pull_request_target` and `workflow_run`, and our workflows use neither trigger. Re-check if one gets added.
 - **Rust toolchain in workflows**: Renovate's `github-actions` manager reads `toolchain:` inputs as a `rust`
@@ -85,5 +87,5 @@ A deliberate, consumer-visible change. Touch every one of these in the same comm
 - `README.md` and `crates/mtp-rs/README.md`: the MSRV badge.
 - `CONTRIBUTING.md`: the MSRV section.
 - `CHANGELOG.md`: a **Breaking** entry ("MSRV raised from A to B").
-- `renovate.json` and this doc: lift any hold the new MSRV unblocks (`serial_test` at 1.93.1, `windows` 0.100 at
-  1.95).
+- `renovate.json` and this doc: lift any hold the new MSRV unblocks (`proptest` 1.12 at 1.88, `serial_test` at
+  1.93.1, `windows` 0.100 at 1.95).
