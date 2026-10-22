@@ -119,7 +119,9 @@ pub(super) struct VirtualDeviceState {
     pub(super) operation_counts: HashMap<u16, u32>,
 }
 
-/// Maximum number of entries in [`VirtualDeviceState::dropped_paths`]; oldest
+/// Maximum number of entries in a device's dropped-paths ring (what
+/// [`dropped_paths_since_pause`](super::registry::dropped_paths_since_pause)
+/// returns); oldest
 /// is evicted on push past this. 1024 comfortably holds the events from a few
 /// hundred concurrent fixture-recreate drains; bounds memory at ~160 KB worst
 /// case (1024 × ~150 byte `PathBuf` average), so long-running test sessions
