@@ -111,14 +111,13 @@ range, window_size)` (returns `WindowedDownload`), and buffered `Storage::downlo
   binary created a root folder, uploaded a root file, verified it, and deleted both. So the old "Android can't create in
   the storage root" line in these docs was describing this bug, not Android.
 - **Android**: Object handles are NOT stable. MediaProvider re-keys object IDs across a media rescan, so a handle a host cached when it last listed a folder can be silently invalidated before a later operation (upload, delete) into that folder: the device then returns `InvalidObjectHandle`/`InvalidParentObject`, not for a missing object but for a stale ID. Hosts should treat those codes on a previously-valid handle as "re-list the parent and re-resolve, then retry once", not as a hard not-found. (A downstream, Cmdr, hit this as a 307 MB upload failing at `SendObjectInfo` and surfacing as "Path not found" on the intact *source* file.) Reproducible against the virtual device with `rekey_virtual_object` (see Testing).
-- **Folder listings use `GetObjectPropList` when advertised** (`UsbBackend::list`, non-root only). Depth 1 returns
-  the folder itself too (Android's `MtpDatabase` does), so `get_object_prop_list_children` drops it. A Xiaomi POCO X7
-  Pro (HyperOS 3) declines "all properties" (`0xFFFFFFFF`) with `InvalidObjectPropCode` (0xA801) in most folders but
-  answers each property alone, and sends a missing `DateCreated` with data type 0 and no value; after one decline the
-  backend asks per property for the rest of the session (`prop_list_all`). Only a decline (`Protocol`/`Io`, as for the
-  root fast path) or an unparseable dataset falls back to `GetObjectInfo` per handle: a sick session must not be hit
-  again with one request per child. Hardware-verified on that phone (Linux/nusb, 2026-10-22): 1,938 objects, fields
-  identical to `GetObjectInfo`, 0.67 s against 7.3 s.
+- **Xiaomi POCO X7 Pro (HyperOS 3)** declines `GetObjectPropList` for "all properties" (`0xFFFFFFFF`) with
+  `InvalidObjectPropCode` (0xA801) in most folders but answers each property alone, and sends a property it has no
+  value for (`DateCreated`) with data type 0 and no value. See § Folder listings via `GetObjectPropList`.
+- **Android's `GetObjectPropList` has no creation date**: AOSP's "all properties" set (`FILE_PROPERTIES` in
+  `MtpDatabase.java`) leaves out `DateCreated`, and asked alone it comes back Undefined. Its `GetObjectInfo` reports
+  `DateCreated` equal to `DateModified`, so fast-path listings there have `created: None` where per-handle listings
+  had a copy of the modification time. Deliberate: we don't synthesize it.
 - **Fujifilm cameras**: Report `AccessCapability::ReadWrite` but return `StoreReadOnly` on writes. Advertised ops lie.
 - **Samsung**: Returns `InvalidObjectHandle` for root listing; needs recursive traversal with filtering
 - **Panasonic Lumix DMC-TZ61** (and likely other PTP cameras): Reports `20480000T000000` (month 0, day 0) as "no date" in ObjectInfo datetimes. Receive-side datetime parsing is lenient for this reason: unparseable datetimes become `None` instead of failing the dataset parse. Send-side packing stays strict.
@@ -144,8 +143,8 @@ range, window_size)` (returns `WindowedDownload`), and buffered `Storage::downlo
 
 - **Unit**: `cargo test --workspace` (uses mock transport)
 - **Filesystem-watcher tests run in their own pass** (`just test` does this for you: everything else, then `fs_watcher` with `--test-threads=1`). They wait on real OS filesystem-event delivery, so inside the ~400-test parallel pool a loaded machine starves them past their poll budget and they fail as a group while passing every time alone. Don't fold them back in, and don't "fix" a flake there by inflating the timeout. Each one also calls `wait_for_watcher_ready` first, which writes a probe file and waits for the watcher to report it: `notify` arms its stream on a background thread, so a write issued straight after `open_virtual` can land before anything is listening. The probe file is deliberately left in place, since deleting it queues a late `ObjectRemoved` that lands after the drain and steals the next test's first event.
-- **Virtual device**: `cargo test -p mtp-rs --features virtual-device` (full protocol tests against local filesystem). `VirtualDeviceConfig` implements `Default`, so build it as `VirtualDeviceConfig { storages: vec![...], ..Default::default() }` and state only the fields a test actually exercises; new fields must land with a default so consumers don't break (see CONTRIBUTING.md). `VirtualStorageConfig` has no `Default` (an unset `backing_dir` fails silently). Fault injection: `force_partial_read_caps` (short/stall reads), `force_cancel_wedge` / `force_operation_wedge` (#18), `force_object_info_error` and `VirtualDeviceConfig::undescribable_objects` (partially-readable folders, #22). Capability shaping: `supports_partial_object` / `supports_partial_object_64` pick which partial-read ops the device advertises AND serves (both `false` models libhaze/Sphaira, where `download(ByteRange::Full)` is the only read). Dates: objects report their backing file's mtime (and birth time) on the clock set by `utc_offset` (default UTC, zoneless unless `dates_include_offset`), and an upload's `DateModified` becomes the file's mtime, so a fixture seeds a date with `File::set_modified`.
-- **Integration**: `cargo test -p mtp-rs --test integration -- --ignored --nocapture` (needs device). Destructive tests pick a writable root folder from a priority list (Android `Download`, Garmin `Music`, Kindle `documents`, etc.); set `MTP_TEST_FOLDER=Name` to override. See `crates/mtp-rs/tests/integration.rs` header for full details.
+- **Virtual device**: `cargo test -p mtp-rs --features virtual-device` (full protocol tests against local filesystem). `VirtualDeviceConfig` implements `Default`, so build it as `VirtualDeviceConfig { storages: vec![...], ..Default::default() }` and state only the fields a test actually exercises; new fields must land with a default so consumers don't break (see CONTRIBUTING.md). `VirtualStorageConfig` has no `Default` (an unset `backing_dir` fails silently). Fault injection: `force_partial_read_caps` (short/stall reads), `force_cancel_wedge` / `force_operation_wedge` (#18), `force_object_info_error` and `VirtualDeviceConfig::undescribable_objects` (partially-readable folders, #22). Capability shaping: `supports_partial_object` / `supports_partial_object_64` pick which partial-read ops the device advertises AND serves (both `false` models libhaze/Sphaira, where `download(ByteRange::Full)` is the only read). `GetObjectPropList` is advertised and served by default (modern Android does), so every non-root virtual-device listing takes the fast path; `supports_object_prop_list: false` turns it off, `prop_list_declines_all` models the Xiaomi (0xA801 for "all"), and `prop_list_declined_properties` declines single properties. It models AOSP (depth 1 includes the folder itself, unknown properties come back Undefined) except that it serves `DateCreated` alone, so both listing paths match field for field. A prop-list answer that would include an `undescribable_objects` / `force_object_info_error` object fails whole with `GeneralError`, so #22 skips still happen on the per-handle fallback. Dates: objects report their backing file's mtime (and birth time) on the clock set by `utc_offset` (default UTC, zoneless unless `dates_include_offset`), and an upload's `DateModified` becomes the file's mtime, so a fixture seeds a date with `File::set_modified`.
+- **Integration**: `cargo test -p mtp-rs --test integration -- --ignored --nocapture` (needs device). Destructive tests pick a writable root folder from a priority list (Android `Download`, Garmin `Music`, Kindle `documents`, etc.); set `MTP_TEST_FOLDER=Name` to override. See `crates/mtp-rs/tests/integration.rs` header for full details. To compare the two listing paths on a real device (read-only, prints timings): `MTP_TEST_LIST_FOLDER=/DCIM/Camera cargo test -p mtp-rs --test integration prop_list -- --ignored --nocapture`, or `cargo run --release -p mtp-rs --example list_speed -- DCIM/Camera`.
 - **CLI**: `cargo test -p mtp-rs-cli --features virtual-device` (runs the built binary against a virtual device)
 - **Property**: `cargo test --workspace --all-features` (proptest fuzzing)
 
@@ -187,6 +186,54 @@ Identity is keyed on `(location_id, vendor_id, product_id, serial_number)`, not 
 alone: swapping phones between two enumerations, or an Android phone re-enumerating from
 charge-only into file transfer (new product ID), must read as `Left` then `Arrived`. A failed
 enumeration keeps the last known set rather than reporting everything as departed.
+
+## Folder listings via `GetObjectPropList`
+
+`UsbBackend::list` lists a **non-root** folder with `GetObjectPropList` (0x9805, depth 1) when the device advertises
+it, instead of `GetObjectHandles` plus one `GetObjectInfo` per child. On Android that's the difference between seconds
+and minutes for a big photo folder: AOSP's `GetObjectInfo` opens every JPEG/HEIF to parse EXIF (`getObjectInfo` in
+`android_mtp_MtpDatabase.cpp`), while its prop list walks an in-memory file list. Contributed in PR #45, then
+hardened. Root listings always stay per handle (they carry the root-filter quirks and are short). WPD is unaffected.
+Consumers can turn it off with `MtpDeviceBuilder::use_object_prop_list(false)`; the CLI has `--no-prop-list`.
+
+The policy lives in `UsbBackend::list_by_prop_list`; `ptp::` only has the spec-shaped
+`PtpSession::get_object_prop_list` and the dataset parser `ObjectPropListElement::list_from_bytes`. Keep it that way.
+
+- **Session mode only moves one way: "all properties", then per property, then off.** "All" (`0xFFFFFFFF`, one
+  request) is tried until the device first declines it or answers something unusable; then the same listing retries
+  per property. Per property asks the required four first (`ParentObject`, `ObjectFileName`, `ObjectFormat`,
+  `ObjectSize`), then the optional dates (`DateModified`, `DateCreated`). StorageId isn't asked: the listed storage
+  fills it in.
+- **AOSP picks the "all properties" group from the first child's format** and reuses it for every object
+  (`getObjectPropertyList` in `MtpDatabase.java`), and that group has no `DateCreated`. So after an "all" answer the
+  backend asks once for any optional date no child carried; a date the device never gives a value for (Android answers
+  Undefined) is remembered for the session.
+- **Never a silent wrong listing.** Every child must carry the required properties (size for files only; a folder's
+  size means nothing), and every `ParentObject` must equal the requested folder. The folder itself (depth 1 includes
+  it) is dropped by handle, never by a parent filter: a filter is how a device that omits `ParentObject` would show up
+  as an empty folder, which `AGENTS.md` § Partially-readable folders forbids. A required property missing from every
+  child, or a mismatched parent, means the device can't do this: off for the session. Missing from only some children
+  (an object created mid-listing) falls back for that listing only.
+- **An empty answer falls through to the per-handle path**, which confirms with one `GetObjectHandles`. One extra
+  request per empty folder buys protection from a device that treats depth 1 like depth 0.
+- **Two kinds of refusal** (`is_prop_list_capability_decline`, next to `is_all_handle_rejection`). Capability
+  declines (`OperationNotSupported`, `ParameterNotSupported`, 0xA801 `InvalidObjectPropCode`, 0xA802
+  `InvalidObjectPropFormat`, 0xA807/0xA808 `SpecificationBy{Group,Depth}Unsupported`, and `Io`, a camera's STALL)
+  demote the session. Every other response code (`GeneralError`, `InvalidObjectHandle`, `AccessDenied`,
+  `DeviceBusy`, …) is about this folder only: fall back once, don't demote. Don't merge the two: Android re-keys
+  handles, so a stale parent would otherwise switch the fast path off for the whole session, and so would one #22
+  folder.
+- **Session failures propagate**, exactly like the root fast path: `Timeout`, `Disconnected`, `DeviceReset`, and a
+  transaction-ID desync (which surfaces as `InvalidData` from the session, so only a dataset that fails to *parse*
+  counts as unusable) must not be answered with one `GetObjectInfo` per child.
+- **What this path doesn't carry**: image pixel dimensions (`ObjectInfo::image_width/height` stay 0; AOSP fills them
+  from EXIF in `GetObjectInfo` only), the association type (folders are detected by the Association format), and skips
+  (a #22-style refusal fails the whole request and the per-handle fallback produces the skip). The listing arrives in
+  one piece, so the `CancelToken` is checked between requests, not between objects.
+- **Hardware evidence**: Xiaomi POCO X7 Pro (HyperOS 3, Linux/nusb, 2026-10-22, contributor's run of the original
+  PR): 1,938 objects, fields identical to `GetObjectInfo`, 0.67 s against 7.3 s. libmtp marks every Android device
+  `DEVICE_FLAG_BROKEN_MTPGETOBJPROPLIST`, so there's little field mileage elsewhere: check new devices with the
+  comparison test (§ Testing).
 
 ## Partially-readable folders (tolerant listing)
 
@@ -255,7 +302,9 @@ For per-handle list/delete this is sufficient and safer than mid-USB-transaction
 cancel: each `GetObjectInfo` and `DeleteObject` roundtrip completes in
 milliseconds, so there's no half-finished transfer to drain. The CancelToken
 short-circuits the per-handle for-loop, which is where 1k-entry Android folder
-listings actually spend their 15+ seconds.
+listings spend their 15+ seconds when they can't use `GetObjectPropList` (see
+§ Folder listings via `GetObjectPropList`; on that path the token is checked
+between the few per-property requests).
 
 Streaming downloads keep using the SIC class-cancel path (see below); that's a
 different mechanism for a different problem (one big bulk-IN to drain).
