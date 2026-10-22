@@ -2809,10 +2809,11 @@ mod tests {
 
         // Android re-keys handles after a media rescan: the cached handle is now unknown.
         super::registry::rekey_virtual_object(serial, std::path::Path::new("DCIM/Camera")).unwrap();
+        // A stale handle must fail, never read as an empty folder.
         let listed = storage.list_objects(Some(stale)).await;
         assert!(
-            listed.as_ref().map_or(true, Vec::is_empty),
-            "a stale handle lists nothing: {listed:?}"
+            matches!(listed, Err(Error::StaleHandle)),
+            "expected StaleHandle, got {listed:?}"
         );
 
         // Re-listing the parent finds the new handle, and that listing is still one

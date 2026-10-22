@@ -201,6 +201,23 @@ fn handle_get_object_handles(
         return;
     }
 
+    // An unknown parent (a stale handle, say) is an error, as on Android, whose
+    // `MtpServer::doGetObjectHandles` answers Invalid_ObjectHandle when the
+    // database finds no such object. An empty OK list would read as an empty
+    // folder, which a host can't tell from "everything was deleted".
+    let known = |state: &VirtualDeviceState| {
+        state
+            .objects
+            .get(&parent.0)
+            .is_some_and(|obj| obj.storage_id == storage_id)
+    };
+    if parent != ObjectHandle::ALL && parent != ObjectHandle::ROOT && !known(state) {
+        state
+            .response_queue
+            .push_back(build_response(INVALID_OBJECT_HANDLE, tx_id, &[]));
+        return;
+    }
+
     let handles_result = if parent == ObjectHandle::ALL {
         state.scan_all(storage_id)
     } else {
