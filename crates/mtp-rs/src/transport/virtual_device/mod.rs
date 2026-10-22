@@ -43,6 +43,7 @@
 mod builders;
 pub mod config;
 mod handlers;
+mod prop_list;
 pub mod registry;
 mod state;
 mod watcher;
