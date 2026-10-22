@@ -201,10 +201,13 @@ impl UsbBackend {
     /// a folder with objects missing. So does an answer with no children: the per-handle path
     /// then confirms the folder is empty with one `GetObjectHandles`, so a device that answers
     /// depth 1 like depth 0 can't make a full folder look empty (which reads as "everything was
-    /// deleted"). Only declines and unusable answers fall back; a failing session propagates.
+    /// deleted"). Only the device saying no and unusable answers fall back; a failing session
+    /// propagates.
     ///
     /// What the device has shown it can't do sticks for the session (see [`PropListMode`] and
     /// [`UsbBackend::prop_list_declined_optional`]), so later listings waste no requests on it.
+    /// A refusal about this folder alone (see [`is_prop_list_capability_decline`]) falls back
+    /// for this listing only.
     async fn list_by_prop_list(
         &self,
         storage: PtpStorageId,
@@ -236,6 +239,7 @@ impl UsbBackend {
                     }
                 }
                 PropListAnswer::Declined | PropListAnswer::Unparseable => {}
+                PropListAnswer::Refused => return Ok(None),
             }
             self.demote_prop_list(PropListMode::PerProperty);
         }
@@ -252,6 +256,7 @@ impl UsbBackend {
                     self.demote_prop_list(PropListMode::Off);
                     return Ok(None);
                 }
+                PropListAnswer::Refused => return Ok(None),
             }
         }
         let mut children = match children_from_prop_list(&elements, storage, parent) {
@@ -313,6 +318,8 @@ impl UsbBackend {
                     served
                 }
                 PropListAnswer::Declined | PropListAnswer::Unparseable => false,
+                // This folder only: the date stays unset this time and is asked again next time.
+                PropListAnswer::Refused => continue,
             };
             if !served {
                 diag_debug!("GetObjectPropList serves no {property:?}; not asking again");
@@ -335,8 +342,9 @@ impl UsbBackend {
     /// One `GetObjectPropList` request for `parent` and its children: `property`, or every
     /// property with `None`.
     ///
-    /// Only a *decline* (see [`is_all_handle_rejection`]) and a dataset we can't parse come back
-    /// as answers; everything else is the session or the transport failing, and propagates.
+    /// Only the device saying no (see [`is_all_handle_rejection`], split by
+    /// [`is_prop_list_capability_decline`]) and a dataset we can't parse come back as answers;
+    /// everything else is the session or the transport failing, and propagates.
     async fn ask_prop_list(
         &self,
         parent: PtpHandle,
@@ -354,9 +362,13 @@ impl UsbBackend {
                     PropListAnswer::Unparseable
                 }
             }),
-            Err(e) if is_all_handle_rejection(&e) => {
+            Err(e) if is_prop_list_capability_decline(&e) => {
                 diag_debug!("GetObjectPropList {property:?} declined ({e})");
                 Ok(PropListAnswer::Declined)
+            }
+            Err(e) if is_all_handle_rejection(&e) => {
+                diag_debug!("GetObjectPropList {property:?} refused for {parent:?} ({e})");
+                Ok(PropListAnswer::Refused)
             }
             Err(e) => Err(e),
         }
@@ -409,8 +421,12 @@ const PROP_LIST_OPTIONAL: [ObjectPropertyCode; 2] = [
 /// What one `GetObjectPropList` request came to, short of a failing session.
 enum PropListAnswer {
     Elements(Vec<ObjectPropListElement>),
-    /// The device answered with a response code (or a STALL): it won't serve this request.
+    /// The device can't serve this request at all (see [`is_prop_list_capability_decline`]):
+    /// remembered for the session.
     Declined,
+    /// The device refused it for this folder (a stale handle, an unreadable object): fall back
+    /// for this listing only.
+    Refused,
     /// The transaction completed, so the session is fine, but the dataset doesn't parse.
     Unparseable,
 }
@@ -550,6 +566,38 @@ fn required_bit(property: ObjectPropertyCode) -> u8 {
 ///   the worse failure.
 fn is_all_handle_rejection(err: &PtpError) -> bool {
     matches!(err, PtpError::Protocol { .. } | PtpError::Io(_))
+}
+
+/// Of the refusals [`is_all_handle_rejection`] accepts, is this one a `GetObjectPropList`
+/// *capability* decline: the operation, the property, or the request's shape isn't servable on
+/// this device at all, so no later listing will do better?
+///
+/// Those demote the session's prop-list mode for good. Every other response code is about the
+/// folder asked for, so it falls back for that listing only: Android re-keys handles after a
+/// media rescan, so a cached folder handle answers `InvalidObjectHandle` (or
+/// `InvalidParentObject`), and one partially-readable folder answers `GeneralError` (#22).
+/// Treating those as capability declines would turn the fast path off for the whole session
+/// over one stale handle or one bad folder.
+///
+/// A STALL (`Io`) counts as a capability decline: it's how SIC cameras say "unsupported
+/// operation" (#12), and it carries no response code to tell otherwise.
+fn is_prop_list_capability_decline(err: &PtpError) -> bool {
+    match err {
+        PtpError::Io(_) => true,
+        PtpError::Protocol { code, .. } => {
+            matches!(
+                code,
+                ResponseCode::OperationNotSupported | ResponseCode::ParameterNotSupported
+            ) || matches!(
+                u16::from(*code),
+                0xA801 // Invalid_ObjectPropCode
+                | 0xA802 // Invalid_ObjectProp_Format
+                | 0xA807 // Specification_By_Group_Unsupported
+                | 0xA808 // Specification_By_Depth_Unsupported
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Build the root filter for an enumerated handle set, deciding whether the
@@ -1422,9 +1470,13 @@ mod tests {
 
         /// Declined with `InvalidObjectPropCode` (0xA801).
         fn decline(&mut self) {
+            self.refuse(ResponseCode::from(0xA801));
+        }
+
+        /// Answered with `code` instead of data.
+        fn refuse(&mut self, code: ResponseCode) {
             let tx = self.next();
-            self.mock
-                .queue_response(error_response(tx, ResponseCode::from(0xA801)));
+            self.mock.queue_response(error_response(tx, code));
         }
 
         fn per_property(&mut self, properties: &[u16], children: &[(u32, &str)]) {
@@ -1814,6 +1866,99 @@ mod tests {
         expected.extend(per_property_requests(&PER_PROPERTY));
         expected.extend(per_property_requests(&PER_PROPERTY[..5]));
         assert_eq!(prop_list_requests(&mock), expected);
+    }
+
+    #[tokio::test]
+    async fn a_stale_folder_handle_falls_back_this_listing_only() {
+        // Android re-keys handles: a folder handle cached before a media rescan answers
+        // InvalidObjectHandle. That says nothing about whether the device lists by prop list.
+        for code in [
+            ResponseCode::InvalidObjectHandle,
+            ResponseCode::InvalidParentObject,
+            ResponseCode::GeneralError,
+            ResponseCode::AccessDenied,
+            ResponseCode::DeviceBusy,
+        ] {
+            let (transport, mock) = mock_transport();
+            let mut device = Answers::new(&mock);
+            let children = [(11, "a.jpg")];
+            device.refuse(code);
+            device.per_handle(&children);
+            device.prop_list(&all_answer(&children));
+
+            let backend = mock_backend_with_prop_list(transport).await;
+            for _ in 0..2 {
+                let objs = list_folder(&backend, None).await.unwrap();
+                assert_eq!(names(&objs), ["a.jpg"], "{code:?}");
+            }
+            assert_eq!(
+                prop_list_requests(&mock),
+                [0xFFFF_FFFF, 0xFFFF_FFFF],
+                "{code:?}: \"all\" is asked again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_folder_refusing_a_required_property_keeps_the_per_property_mode() {
+        let (transport, mock) = mock_transport();
+        let mut device = Answers::new(&mock);
+        let children = [(11, "a.jpg")];
+        device.decline();
+        device.per_property(&PER_PROPERTY[..1], &children);
+        device.refuse(ResponseCode::GeneralError); // ObjectFileName, for this folder only
+        device.per_handle(&children);
+        device.per_property(&PER_PROPERTY, &children);
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        for _ in 0..2 {
+            let objs = list_folder(&backend, None).await.unwrap();
+            assert_eq!(names(&objs), ["a.jpg"]);
+        }
+        let mut expected = vec![0xFFFF_FFFF];
+        expected.extend(per_property_requests(&PER_PROPERTY[..2]));
+        expected.extend(per_property_requests(&PER_PROPERTY));
+        assert_eq!(prop_list_requests(&mock), expected);
+    }
+
+    #[tokio::test]
+    async fn a_folder_refusing_a_date_is_asked_again_next_listing() {
+        let (transport, mock) = mock_transport();
+        let mut device = Answers::new(&mock);
+        let children = [(11, "a.jpg")];
+        device.prop_list(&all_answer_without(CREATED, &children));
+        device.refuse(ResponseCode::GeneralError);
+        device.prop_list(&all_answer_without(CREATED, &children));
+        device.prop_list(&answer(CREATED, &children));
+
+        let backend = mock_backend_with_prop_list(transport).await;
+        let first = list_folder(&backend, None).await.unwrap();
+        assert_eq!(first[0].created, None);
+        let second = list_folder(&backend, None).await.unwrap();
+        assert!(second[0].created.is_some());
+        let ask = [0xFFFF_FFFF, u32::from(CREATED)];
+        assert_eq!(prop_list_requests(&mock), [ask, ask].concat());
+    }
+
+    #[tokio::test]
+    async fn capability_declines_stick_for_the_session() {
+        for code in [0x2005, 0x2006, 0xA801, 0xA802, 0xA807, 0xA808] {
+            let (transport, mock) = mock_transport();
+            let mut device = Answers::new(&mock);
+            let children = [(11, "a.jpg")];
+            device.refuse(ResponseCode::from(code));
+            device.per_property(&PER_PROPERTY, &children);
+            device.per_property(&PER_PROPERTY, &children);
+
+            let backend = mock_backend_with_prop_list(transport).await;
+            for _ in 0..2 {
+                list_folder(&backend, None).await.unwrap();
+            }
+            let mut expected = vec![0xFFFF_FFFF];
+            expected.extend(per_property_requests(&PER_PROPERTY));
+            expected.extend(per_property_requests(&PER_PROPERTY));
+            assert_eq!(prop_list_requests(&mock), expected, "{code:#06x}");
+        }
     }
 
     #[tokio::test]

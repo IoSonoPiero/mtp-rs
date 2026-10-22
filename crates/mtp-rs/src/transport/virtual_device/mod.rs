@@ -2823,5 +2823,19 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, ["IMG_0001.jpg", "clip.mp4"]);
         assert_eq!(collection.skipped.len(), 1);
+
+        // One bad folder doesn't turn the fast path off for the others.
+        let music = storage.list_objects(None).await.unwrap();
+        let music = music.iter().find(|o| o.filename == "Music").unwrap().handle;
+        let (prop_lists, infos) = (prop_list_requests(serial), object_info_requests(serial));
+        assert_eq!(storage.list_objects(Some(music)).await.unwrap().len(), 1);
+        assert_eq!(
+            (
+                prop_list_requests(serial) - prop_lists,
+                object_info_requests(serial) - infos
+            ),
+            (2, 0),
+            "\"all properties\" and DateCreated, no GetObjectInfo"
+        );
     }
 }
