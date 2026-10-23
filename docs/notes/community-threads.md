@@ -54,24 +54,7 @@ Reports from this thread:
 
 ## Active threads
 
-### #45: List folders with `GetObjectPropList` (opened 2026-10-22, in progress)
-
-Contributor: [@IoSonoPiero](https://github.com/IoSonoPiero). Lists a non-root folder with one or a few
-`GetObjectPropList` (0x9805, depth 1) requests instead of one `GetObjectInfo` per child. Their evidence, on the POCO X7
-Pro under Linux: a 1,938-object tree in 0.67 s instead of 7.3 s, fields identical; a 797-object folder in about 90 ms
-instead of 3.8 s. The phone declines "all properties" with 0xA801 in most folders and serves single properties, and
-sends a valueless `DateCreated` as data type 0. They also used it from their own app for copies both ways.
-
-We built on top of their commit (kept as-is) on a local branch, 2026-10-23: moved the policy from `ptp::` into
-`UsbBackend`, made a partial answer fall back rather than show a short or empty folder, split capability declines
-(sticky for the session) from per-folder refusals (stale handle, #22-style folder), restored dates "all" leaves out,
-added virtual-device support (on by default), a `use_object_prop_list(false)` opt-out and CLI `--no-prop-list`, and a
-read-only hardware comparison test plus `examples/list_speed.rs`. Then dropped the "all properties" request
-entirely: on a Pixel 9 Pro XL it took 3.2 s before being declined in a PNG folder (AOSP picks the group from the
-first child's format), so listings now always ask one property at a time. Design: `AGENTS.md` § Folder listings via
-`GetObjectPropList`. Hardware-checked read-only on 2026-10-23 on a Pixel 9 Pro XL (4–12× faster) and a Galaxy S23
-Ultra (3,248 photos in 0.40 s against 5.5 s), fields identical apart from Android's `created` and image size. Next:
-cameras, a rerun on the POCO by @IoSonoPiero, then landing.
+None right now.
 
 ## Closed and merged
 
@@ -475,6 +458,26 @@ internal storage. Full logs offered, not yet requested.
   `0x2009` has been seen in the wild. TDD'd on Windows CI (red, then green), and **hardware-confirmed** by
   @IoSonoPiero on the POCO X7 Pro under Windows 11 on 2026-10-22 ([comment](https://github.com/vdavid/mtp-rs/pull/42#issuecomment-6336278553)).
   The README row now says full support on Linux and Windows.
+
+### #45: List folders with `GetObjectPropList` (merged 2026-10-23, shipped in v0.34.0)
+
+Contributor: [@IoSonoPiero](https://github.com/IoSonoPiero). Lists a non-root folder with one or a few
+`GetObjectPropList` (0x9805, depth 1) requests instead of one `GetObjectInfo` per child. Their evidence, on the POCO X7
+Pro under Linux: a 1,938-object tree in 0.67 s instead of 7.3 s, fields identical; a 797-object folder in about 90 ms
+instead of 3.8 s. The phone declines "all properties" with 0xA801 in most folders and serves single properties, and
+sends a valueless `DateCreated` as data type 0. They also used it from their own app for copies both ways.
+
+We built on top of their commit (kept as-is) on a local branch, 2026-10-23: moved the policy from `ptp::` into
+`UsbBackend`, made a partial answer fall back rather than show a short or empty folder, split capability declines
+(sticky for the session) from per-folder refusals (stale handle, #22-style folder), restored dates "all" leaves out,
+added virtual-device support (on by default), a `use_object_prop_list(false)` opt-out and CLI `--no-prop-list`, and a
+read-only hardware comparison test plus `examples/list_speed.rs`. Then dropped the "all properties" request
+entirely: on a Pixel 9 Pro XL it took 3.2 s before being declined in a PNG folder (AOSP picks the group from the
+first child's format), so listings now always ask one property at a time. Design: `AGENTS.md` § Folder listings via
+`GetObjectPropList`. Hardware-checked read-only on 2026-10-23 on a Pixel 9 Pro XL (4–12× faster) and a Galaxy S23
+Ultra (3,248 photos in 0.40 s against 5.5 s), fields identical apart from Android's `created` and image size. Landed by
+fast-forward, so the PR shows as merged with their commit intact; released as lib 0.34.0 and CLI 0.10.0 the same day.
+Open item: a rerun of the comparison on the POCO by @IoSonoPiero, since the request pattern changed.
 
 ## Device quirks reference
 
