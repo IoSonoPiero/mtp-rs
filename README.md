@@ -4,7 +4,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 Pure-Rust MTP/PTP for modern Android phones, e-readers, Garmin watches, and cameras. No `libmtp`, no `libusb`, no FFI.
-Async, runtime-agnostic, consistently faster than libmtp.
+Async, runtime-agnostic, consistently faster than libmtp, and big Android folders list in a fraction of a second.
 
 This repo ships two crates:
 
