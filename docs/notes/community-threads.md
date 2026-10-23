@@ -69,7 +69,9 @@ added virtual-device support (on by default), a `use_object_prop_list(false)` op
 read-only hardware comparison test plus `examples/list_speed.rs`. Then dropped the "all properties" request
 entirely: on a Pixel 9 Pro XL it took 3.2 s before being declined in a PNG folder (AOSP picks the group from the
 first child's format), so listings now always ask one property at a time. Design: `AGENTS.md` § Folder listings via
-`GetObjectPropList`. Next: hardware runs on more phones and cameras before landing.
+`GetObjectPropList`. Hardware-checked read-only on 2026-10-23 on a Pixel 9 Pro XL (4–12× faster) and a Galaxy S23
+Ultra (3,248 photos in 0.40 s against 5.5 s), fields identical apart from Android's `created` and image size. Next:
+cameras, a rerun on the POCO by @IoSonoPiero, then landing.
 
 ## Closed and merged
 

@@ -234,7 +234,11 @@ The policy lives in `UsbBackend::list_by_prop_list`; `ptp::` only has the spec-s
   (a #22-style refusal fails the whole request and the per-handle fallback produces the skip). The listing arrives in
   one piece, so the `CancelToken` is checked between requests, not between objects.
 - **Hardware evidence**: Xiaomi POCO X7 Pro (HyperOS 3, Linux/nusb, 2026-10-22, contributor's run of the original
-  PR): 1,938 objects, fields identical to `GetObjectInfo`, 0.67 s against 7.3 s. libmtp marks every Android device
+  PR): 1,938 objects, fields identical to `GetObjectInfo`, 0.67 s against 7.3 s. With the per-property-only policy
+  (macOS/nusb, 2026-10-23, `examples/list_speed.rs`, per-handle side timed warm): Pixel 9 Pro XL, 274 photos 0.24 s
+  against 2.2–2.8 s and 726 PNGs 0.18 s against 0.92 s; Galaxy S23 Ultra SM-S918B (One UI firmware S918BXXSAFZI1),
+  3,248 photos 0.40 s against 5.5 s and 1,916 screenshots 0.18 s against 2.6 s. Every field identical on both phones
+  apart from Android's `created` (None) and image size (0). libmtp marks every Android device
   `DEVICE_FLAG_BROKEN_MTPGETOBJPROPLIST`, so there's little field mileage elsewhere: check new devices with the
   comparison test (§ Testing).
 
