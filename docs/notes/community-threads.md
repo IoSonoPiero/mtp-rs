@@ -66,7 +66,9 @@ We built on top of their commit (kept as-is) on a local branch, 2026-10-23: move
 `UsbBackend`, made a partial answer fall back rather than show a short or empty folder, split capability declines
 (sticky for the session) from per-folder refusals (stale handle, #22-style folder), restored dates "all" leaves out,
 added virtual-device support (on by default), a `use_object_prop_list(false)` opt-out and CLI `--no-prop-list`, and a
-read-only hardware comparison test plus `examples/list_speed.rs`. Design: `AGENTS.md` § Folder listings via
+read-only hardware comparison test plus `examples/list_speed.rs`. Then dropped the "all properties" request
+entirely: on a Pixel 9 Pro XL it took 3.2 s before being declined in a PNG folder (AOSP picks the group from the
+first child's format), so listings now always ask one property at a time. Design: `AGENTS.md` § Folder listings via
 `GetObjectPropList`. Next: hardware runs on more phones and cameras before landing.
 
 ## Closed and merged
@@ -504,7 +506,7 @@ Cross-cutting summary of every quirk currently handled or known. Sorted by devic
 | Switch responders (DBI, Sphaira) | Root objects report the containing storage ID as their parent                                                                              | Root filter accepts the storage ID, unless it's also an enumerated handle            | #20 (@oenderg, 2026-08-08)           |
 | Sphaira (Nintendo Switch)    | `GetObjectInfo` fails with `GeneralError` for one handle in an otherwise readable folder                                                       | `collect_objects` skips it and reports it in `skipped`; all-skipped is still an error | #22 / #23 (@oenderg, 2026-08-08)     |
 | Teenage Engineering TP-7     | Keeps its session across host processes; `CloseSession` makes it leave MTP mode                                                                | Opt-in `MtpDeviceBuilder::reuse_existing_session(0xBAAA_AAAD)`                       | #29 (@worm-emoji, 2026-08-26)        |
-| Xiaomi POCO X7 Pro (HyperOS)  | Declines `GetObjectPropList` for "all properties" with 0xA801 in most folders; serves single properties; valueless `DateCreated` as data type 0 | Per-property mode for the rest of the session; Undefined values skipped | #45 (@IoSonoPiero, 2026-10-22) |
+| Xiaomi POCO X7 Pro (HyperOS)  | Declines `GetObjectPropList` for "all properties" with 0xA801 in most folders; serves single properties; valueless `DateCreated` as data type 0 | Per-property listing (we never ask "all", see AGENTS.md); Undefined values skipped | #45 (@IoSonoPiero, 2026-10-22) |
 | Windows WPD (POCO X7 Pro)    | The driver returns MTP response codes wrapped as `FACILITY_ITF` HRESULTs (`0x8004_2009` for `InvalidObjectHandle` on a deleted handle) | `map_hresult` unwraps them and maps them like the USB backend (#42, v0.33.2) | #41 (@IoSonoPiero, 2026-10-21) |
 | Montblanc Digital Paper e-Ink | Android-based hot-folder responder: only an import and an export folder exposed; the device ingests only files newly written directly into the import folder (nested or moved-in files persist and list, but stay invisible on the device) | None possible (invisible to MTP); re-upload with `put --replace`; documented in the CLI reference | #6 (@ChristianSimonSU, 2026-09-22)   |
 

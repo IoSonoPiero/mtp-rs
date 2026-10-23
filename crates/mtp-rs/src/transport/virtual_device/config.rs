@@ -68,8 +68,8 @@ pub struct VirtualDeviceConfig {
     /// unadvertised.
     pub supports_partial_object: bool,
     /// Whether the device advertises and serves `GetObjectPropList` (0x9805), which
-    /// lets a host list a folder's children in one request instead of one
-    /// `GetObjectInfo` each. Modern Android advertises it, so this defaults to
+    /// lets a host list a folder's children in one request per property instead of
+    /// one `GetObjectInfo` each. Modern Android advertises it, so this defaults to
     /// `true`; set `false` to model a responder without it (most PTP cameras) and
     /// exercise the per-handle listing. Like the partial-read flags, `false` means
     /// the operation is *refused*, not merely unadvertised.
@@ -77,7 +77,8 @@ pub struct VirtualDeviceConfig {
     /// The answers model Android's `MtpDatabase.getObjectPropertyList`: group code
     /// 0 only, depth 0 or 1, a depth-1 answer lists the folder's children and then
     /// the folder itself, "all properties" (`0xFFFFFFFF`) returns Android's file
-    /// property set (which has no `DateCreated`), and a property the device doesn't
+    /// property set (which has no `DateCreated`; the library's listings never ask
+    /// for it, but low-level `ptp::` callers can), and a property the device doesn't
     /// know comes back with data type `Undefined` and no value. Every value matches
     /// what `GetObjectInfo` reports for the same object, except that `ObjectSize`
     /// is the full 64-bit size. An object that `GetObjectInfo` refuses to describe
@@ -85,10 +86,6 @@ pub struct VirtualDeviceConfig {
     /// [`force_object_info_error`](super::registry::force_object_info_error)) fails
     /// any `GetObjectPropList` whose answer would include it.
     pub supports_object_prop_list: bool,
-    /// Whether `GetObjectPropList` declines "all properties" (`0xFFFFFFFF`) with
-    /// `Invalid_ObjectPropCode` (0xA801) while still serving one property at a
-    /// time, the way some Xiaomi phones do. Defaults to `false`.
-    pub prop_list_declines_all: bool,
     /// Properties that `GetObjectPropList` declines with `Invalid_ObjectPropCode`
     /// (0xA801) when asked for one at a time. Use it to model a device that can't
     /// serve a property a host needs (or would like). Defaults to empty.
@@ -179,7 +176,6 @@ impl Default for VirtualDeviceConfig {
             supports_partial_object_64: true,
             supports_partial_object: true,
             supports_object_prop_list: true,
-            prop_list_declines_all: false,
             prop_list_declined_properties: Vec::new(),
             event_poll_interval: Duration::from_millis(50),
             watch_backing_dirs: true,

@@ -89,9 +89,6 @@ fn answer(state: &mut VirtualDeviceState, params: &[u32]) -> Result<Vec<u8>, u16
             .contains(&ObjectPropertyCode::from(code))
     };
     let properties: Vec<u16> = if property == ALL {
-        if state.config.prop_list_declines_all {
-            return Err(INVALID_OBJECT_PROP_CODE);
-        }
         FILE_PROPERTIES
             .into_iter()
             .filter(|&p| !declined(p))
@@ -574,20 +571,6 @@ mod tests {
             handles(&prop_list(&mut state, 0, name, 0xFFFF_FFFF).unwrap()).len(),
             5
         );
-    }
-
-    #[test]
-    fn declining_all_properties_still_serves_them_one_at_a_time() {
-        let dir = tree();
-        let mut state = open_state(dir.path(), |c| c.prop_list_declines_all = true);
-        let photos = handle_of(&mut state, "Photos");
-
-        assert_eq!(
-            prop_list(&mut state, photos, ALL_PROPERTIES, 1),
-            Err(INVALID_OBJECT_PROP_CODE)
-        );
-        let name = code(ObjectPropertyCode::ObjectFileName);
-        assert_eq!(prop_list(&mut state, photos, name, 1).unwrap().len(), 3);
     }
 
     #[test]

@@ -113,8 +113,9 @@ range, window_size)` (returns `WindowedDownload`), and buffered `Storage::downlo
 - **Android**: Object handles are NOT stable. MediaProvider re-keys object IDs across a media rescan, so a handle a host cached when it last listed a folder can be silently invalidated before a later operation (upload, delete) into that folder: the device then returns `InvalidObjectHandle`/`InvalidParentObject`, not for a missing object but for a stale ID. Hosts should treat those codes on a previously-valid handle as "re-list the parent and re-resolve, then retry once", not as a hard not-found. (A downstream, Cmdr, hit this as a 307 MB upload failing at `SendObjectInfo` and surfacing as "Path not found" on the intact *source* file.) Reproducible against the virtual device with `rekey_virtual_object` (see Testing).
 - **Xiaomi POCO X7 Pro (HyperOS 3)** declines `GetObjectPropList` for "all properties" (`0xFFFFFFFF`) with
   `InvalidObjectPropCode` (0xA801) in most folders but answers each property alone, and sends a property it has no
-  value for (`DateCreated`) with data type 0 and no value. See § Folder listings via `GetObjectPropList`.
-- **Android's `GetObjectPropList` has no creation date**: AOSP's "all properties" set (`FILE_PROPERTIES` in
+  value for (`DateCreated`) with data type 0 and no value. We never ask "all"; see § Folder listings via
+  `GetObjectPropList`.
+- **Android's `GetObjectPropList` has no creation date**: AOSP's file property set (`FILE_PROPERTIES` in
   `MtpDatabase.java`) leaves out `DateCreated`, and asked alone it comes back Undefined. Its `GetObjectInfo` reports
   `DateCreated` equal to `DateModified`, so fast-path listings there have `created: None` where per-handle listings
   had a copy of the modification time. Deliberate: we don't synthesize it.
@@ -143,7 +144,7 @@ range, window_size)` (returns `WindowedDownload`), and buffered `Storage::downlo
 
 - **Unit**: `cargo test --workspace` (uses mock transport)
 - **Filesystem-watcher tests run in their own pass** (`just test` does this for you: everything else, then `fs_watcher` with `--test-threads=1`). They wait on real OS filesystem-event delivery, so inside the ~400-test parallel pool a loaded machine starves them past their poll budget and they fail as a group while passing every time alone. Don't fold them back in, and don't "fix" a flake there by inflating the timeout. Each one also calls `wait_for_watcher_ready` first, which writes a probe file and waits for the watcher to report it: `notify` arms its stream on a background thread, so a write issued straight after `open_virtual` can land before anything is listening. The probe file is deliberately left in place, since deleting it queues a late `ObjectRemoved` that lands after the drain and steals the next test's first event.
-- **Virtual device**: `cargo test -p mtp-rs --features virtual-device` (full protocol tests against local filesystem). `VirtualDeviceConfig` implements `Default`, so build it as `VirtualDeviceConfig { storages: vec![...], ..Default::default() }` and state only the fields a test actually exercises; new fields must land with a default so consumers don't break (see CONTRIBUTING.md). `VirtualStorageConfig` has no `Default` (an unset `backing_dir` fails silently). Fault injection: `force_partial_read_caps` (short/stall reads), `force_cancel_wedge` / `force_operation_wedge` (#18), `force_object_info_error` and `VirtualDeviceConfig::undescribable_objects` (partially-readable folders, #22). Capability shaping: `supports_partial_object` / `supports_partial_object_64` pick which partial-read ops the device advertises AND serves (both `false` models libhaze/Sphaira, where `download(ByteRange::Full)` is the only read). `GetObjectPropList` is advertised and served by default (modern Android does), so every non-root virtual-device listing takes the fast path; `supports_object_prop_list: false` turns it off, `prop_list_declines_all` models the Xiaomi (0xA801 for "all"), and `prop_list_declined_properties` declines single properties. It models AOSP (depth 1 includes the folder itself, unknown properties come back Undefined) except that it serves `DateCreated` alone, so both listing paths match field for field. A prop-list answer that would include an `undescribable_objects` / `force_object_info_error` object fails whole with `GeneralError`, so #22 skips still happen on the per-handle fallback. Dates: objects report their backing file's mtime (and birth time) on the clock set by `utc_offset` (default UTC, zoneless unless `dates_include_offset`), and an upload's `DateModified` becomes the file's mtime, so a fixture seeds a date with `File::set_modified`.
+- **Virtual device**: `cargo test -p mtp-rs --features virtual-device` (full protocol tests against local filesystem). `VirtualDeviceConfig` implements `Default`, so build it as `VirtualDeviceConfig { storages: vec![...], ..Default::default() }` and state only the fields a test actually exercises; new fields must land with a default so consumers don't break (see CONTRIBUTING.md). `VirtualStorageConfig` has no `Default` (an unset `backing_dir` fails silently). Fault injection: `force_partial_read_caps` (short/stall reads), `force_cancel_wedge` / `force_operation_wedge` (#18), `force_object_info_error` and `VirtualDeviceConfig::undescribable_objects` (partially-readable folders, #22). Capability shaping: `supports_partial_object` / `supports_partial_object_64` pick which partial-read ops the device advertises AND serves (both `false` models libhaze/Sphaira, where `download(ByteRange::Full)` is the only read). `GetObjectPropList` is advertised and served by default (modern Android does), so every non-root virtual-device listing takes the fast path; `supports_object_prop_list: false` turns it off, and `prop_list_declined_properties` declines single properties. It models AOSP (depth 1 includes the folder itself, unknown properties come back Undefined) except that it serves `DateCreated` alone, so both listing paths match field for field. A prop-list answer that would include an `undescribable_objects` / `force_object_info_error` object fails whole with `GeneralError`, so #22 skips still happen on the per-handle fallback. Dates: objects report their backing file's mtime (and birth time) on the clock set by `utc_offset` (default UTC, zoneless unless `dates_include_offset`), and an upload's `DateModified` becomes the file's mtime, so a fixture seeds a date with `File::set_modified`.
 - **Integration**: `cargo test -p mtp-rs --test integration -- --ignored --nocapture` (needs device). Destructive tests pick a writable root folder from a priority list (Android `Download`, Garmin `Music`, Kindle `documents`, etc.); set `MTP_TEST_FOLDER=Name` to override. See `crates/mtp-rs/tests/integration.rs` header for full details. To compare the two listing paths on a real device (read-only, prints timings): `MTP_TEST_LIST_FOLDER=/DCIM/Camera cargo test -p mtp-rs --test integration prop_list -- --ignored --nocapture`, or `cargo run --release -p mtp-rs --example list_speed -- DCIM/Camera`.
 - **CLI**: `cargo test -p mtp-rs-cli --features virtual-device` (runs the built binary against a virtual device)
 - **Property**: `cargo test --workspace --all-features` (proptest fuzzing)
@@ -199,15 +200,17 @@ Consumers can turn it off with `MtpDeviceBuilder::use_object_prop_list(false)`; 
 The policy lives in `UsbBackend::list_by_prop_list`; `ptp::` only has the spec-shaped
 `PtpSession::get_object_prop_list` and the dataset parser `ObjectPropListElement::list_from_bytes`. Keep it that way.
 
-- **Session mode only moves one way: "all properties", then per property, then off.** "All" (`0xFFFFFFFF`, one
-  request) is tried until the device first declines it or answers something unusable; then the same listing retries
-  per property. Per property asks the required four first (`ParentObject`, `ObjectFileName`, `ObjectFormat`,
-  `ObjectSize`), then the optional dates (`DateModified`, `DateCreated`). StorageId isn't asked: the listed storage
-  fills it in.
-- **AOSP picks the "all properties" group from the first child's format** and reuses it for every object
-  (`getObjectPropertyList` in `MtpDatabase.java`), and that group has no `DateCreated`. So after an "all" answer the
-  backend asks once for any optional date no child carried; a date the device never gives a value for (Android answers
-  Undefined) is remembered for the session.
+- **One request per property, never "all properties" (`0xFFFFFFFF`).** The required four first (`ParentObject`,
+  `ObjectFileName`, `ObjectFormat`, `ObjectSize`), then the optional dates (`DateModified`, `DateCreated`). StorageId
+  isn't asked: the listed storage fills it in. A date the device declines or never gives a value for (Android answers
+  `DateCreated` Undefined) is remembered for the session. The session state only moves one way: on, then off.
+- **Why not "all"**: AOSP picks the "all properties" group from the *first child's* format and reuses it for every
+  object (`getObjectPropertyList` in `MtpDatabase.java`), so whether it works and what it costs depend on which file
+  happens to come first. On a Pixel 9 Pro XL (macOS/nusb, 2026-10-23), `/Pictures/Screenshots` (726 PNGs) spent 3.2 s
+  on "all" and then got 0xA801 (`InvalidObjectPropCode`); the per-property requests that followed took ~50 ms each
+  (~0.25 s), while the per-handle listing of that folder is ~0.9 s. In `DCIM/Camera` (JPEGs) "all" worked. The Xiaomi
+  declines it too. With 10k objects a failing "all" could take tens of seconds or hit the 30 s timeout, so don't
+  bring it back as a first try.
 - **Never a silent wrong listing.** Every child must carry the required properties (size for files only; a folder's
   size means nothing), and every `ParentObject` must equal the requested folder. The folder itself (depth 1 includes
   it) is dropped by handle, never by a parent filter: a filter is how a device that omits `ParentObject` would show up
@@ -219,8 +222,8 @@ The policy lives in `UsbBackend::list_by_prop_list`; `ptp::` only has the spec-s
 - **Two kinds of refusal** (`is_prop_list_capability_decline`, next to `is_all_handle_rejection`). Capability
   declines (`OperationNotSupported`, `ParameterNotSupported`, 0xA801 `InvalidObjectPropCode`, 0xA802
   `InvalidObjectPropFormat`, 0xA807/0xA808 `SpecificationBy{Group,Depth}Unsupported`, and `Io`, a camera's STALL)
-  demote the session. Every other response code (`GeneralError`, `InvalidObjectHandle`, `AccessDenied`,
-  `DeviceBusy`, …) is about this folder only: fall back once, don't demote. Don't merge the two: Android re-keys
+  turn it off for the session. Every other response code (`GeneralError`, `InvalidObjectHandle`, `AccessDenied`,
+  `DeviceBusy`, …) is about this folder only: fall back once, keep it on. Don't merge the two: Android re-keys
   handles, so a stale parent would otherwise switch the fast path off for the whole session, and so would one #22
   folder.
 - **Session failures propagate**, exactly like the root fast path: `Timeout`, `Disconnected`, `DeviceReset`, and a

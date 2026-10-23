@@ -29,7 +29,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,8 +88,9 @@ pub(crate) struct UsbBackend {
     /// which lets a folder listing skip the per-child `GetObjectInfo` (see
     /// [`UsbBackend::list_by_prop_list`]).
     has_object_prop_list: bool,
-    /// A [`PropListMode`]: how `GetObjectPropList` listings go on this session.
-    prop_list_mode: AtomicU8,
+    /// Set once the device has shown it can't serve the required properties: listings go per
+    /// handle for the rest of the session. Never cleared.
+    prop_list_off: AtomicBool,
     /// [`PROP_LIST_OPTIONAL`] properties the device declined, as bits by position: not asked
     /// again this session.
     prop_list_declined_optional: AtomicU8,
@@ -120,7 +121,7 @@ impl UsbBackend {
             has_partial_object_64,
             has_partial_object,
             has_object_prop_list,
-            prop_list_mode: AtomicU8::new(PropListMode::All as u8),
+            prop_list_off: AtomicBool::new(false),
             prop_list_declined_optional: AtomicU8::new(0),
         }
     }
@@ -192,9 +193,11 @@ impl UsbBackend {
     /// List `parent`'s children with `GetObjectPropList` (depth 1) instead of one `GetObjectInfo`
     /// per child, or `Ok(None)` to have the caller list per handle.
     ///
-    /// First every property in one request. Once that's declined or its answer is unusable, one
-    /// request per property: [`PROP_LIST_REQUIRED`], then [`PROP_LIST_OPTIONAL`]. Sizes come from
-    /// the 64-bit `ObjectSize` property, so files over 4 GB need no extra lookup.
+    /// One request per property: [`PROP_LIST_REQUIRED`], then [`PROP_LIST_OPTIONAL`]. Never "all
+    /// properties" (`0xFFFFFFFF`): Android builds that answer from the first child's format group,
+    /// so whether it succeeds and how long it takes depend on which file happens to come first,
+    /// and a failing one can take seconds before it's declined. Sizes come from the 64-bit
+    /// `ObjectSize` property, so files over 4 GB need no extra lookup.
     ///
     /// An answer stands in for the per-handle listing only when every child carries the required
     /// properties and names `parent` as its parent; anything else falls back rather than showing
@@ -204,8 +207,9 @@ impl UsbBackend {
     /// deleted"). Only the device saying no and unusable answers fall back; a failing session
     /// propagates.
     ///
-    /// What the device has shown it can't do sticks for the session (see [`PropListMode`] and
-    /// [`UsbBackend::prop_list_declined_optional`]), so later listings waste no requests on it.
+    /// What the device has shown it can't do sticks for the session (see
+    /// [`UsbBackend::prop_list_off`] and [`UsbBackend::prop_list_declined_optional`]), so later
+    /// listings waste no requests on it.
     /// A refusal about this folder alone (see [`is_prop_list_capability_decline`]) falls back
     /// for this listing only.
     async fn list_by_prop_list(
@@ -214,46 +218,17 @@ impl UsbBackend {
         parent: PtpHandle,
         cancel: Option<&CancelToken>,
     ) -> Result<Option<Vec<PtpObjectInfo>>, PtpError> {
-        if self.prop_list_mode() == PropListMode::All {
-            match self.ask_prop_list(parent, None).await? {
-                PropListAnswer::Elements(elements) => {
-                    match children_from_prop_list(&elements, storage, parent) {
-                        Ok(children) if children.is_empty() => return Ok(None),
-                        Ok(mut children) => {
-                            let answered: Vec<_> = PROP_LIST_OPTIONAL
-                                .into_iter()
-                                .filter(|&p| {
-                                    elements.iter().any(|e| {
-                                        e.property == p && e.handle != parent && e.value.is_some()
-                                    })
-                                })
-                                .collect();
-                            self.add_optional_properties(parent, &mut children, &answered, cancel)
-                                .await?;
-                            return Ok(Some(children));
-                        }
-                        Err(_why) => diag_debug!(
-                            "GetObjectPropList for all properties: {_why:?}; asking one property \
-                             at a time"
-                        ),
-                    }
-                }
-                PropListAnswer::Declined | PropListAnswer::Unparseable => {}
-                PropListAnswer::Refused => return Ok(None),
-            }
-            self.demote_prop_list(PropListMode::PerProperty);
-        }
-        if self.prop_list_mode() == PropListMode::Off {
+        if self.prop_list_off.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
         let mut elements = Vec::new();
         for property in PROP_LIST_REQUIRED {
             bail_if_cancelled(cancel)?;
-            match self.ask_prop_list(parent, Some(property)).await? {
+            match self.ask_prop_list(parent, property).await? {
                 PropListAnswer::Elements(answer) => elements.extend(answer),
                 PropListAnswer::Declined | PropListAnswer::Unparseable => {
-                    self.demote_prop_list(PropListMode::Off);
+                    self.prop_list_off.store(true, Ordering::Relaxed);
                     return Ok(None);
                 }
                 PropListAnswer::Refused => return Ok(None),
@@ -265,28 +240,25 @@ impl UsbBackend {
             Err(why) => {
                 diag_debug!("GetObjectPropList per property: {why:?}");
                 if why == Unusable::Systemic {
-                    self.demote_prop_list(PropListMode::Off);
+                    self.prop_list_off.store(true, Ordering::Relaxed);
                 }
                 return Ok(None);
             }
         };
-        self.add_optional_properties(parent, &mut children, &[], cancel)
+        self.add_optional_properties(parent, &mut children, cancel)
             .await?;
         Ok(Some(children))
     }
 
-    /// Ask for each of [`PROP_LIST_OPTIONAL`] not in `answered` and set it on `children`.
+    /// Ask for each of [`PROP_LIST_OPTIONAL`] and set it on `children`.
     ///
-    /// "All properties" isn't all of them everywhere: Android's leaves out `DateCreated`. So a
-    /// date an "all" answer didn't carry is asked on its own, and the per-property mode asks
-    /// both. A decline, or an answer that gives no child a value (Android answers
-    /// `DateCreated` as `Undefined` for every object), is remembered for the session, so it
-    /// costs one request per session rather than one per listing.
+    /// A decline, or an answer that gives no child a value (Android answers `DateCreated` as
+    /// `Undefined` for every object), is remembered for the session, so it costs one request
+    /// per session rather than one per listing.
     async fn add_optional_properties(
         &self,
         parent: PtpHandle,
         children: &mut [PtpObjectInfo],
-        answered: &[ObjectPropertyCode],
         cancel: Option<&CancelToken>,
     ) -> Result<(), PtpError> {
         let index: HashMap<PtpHandle, usize> = children
@@ -296,13 +268,11 @@ impl UsbBackend {
             .collect();
         for (bit, property) in PROP_LIST_OPTIONAL.into_iter().enumerate() {
             let bit = 1 << bit;
-            if answered.contains(&property)
-                || self.prop_list_declined_optional.load(Ordering::Relaxed) & bit != 0
-            {
+            if self.prop_list_declined_optional.load(Ordering::Relaxed) & bit != 0 {
                 continue;
             }
             bail_if_cancelled(cancel)?;
-            let served = match self.ask_prop_list(parent, Some(property)).await? {
+            let served = match self.ask_prop_list(parent, property).await? {
                 // Objects that arrived since the required answers aren't in `index`; they show
                 // up in the next listing. Only the asked property is taken, so an answer can't
                 // overwrite a required one that was already checked.
@@ -330,17 +300,7 @@ impl UsbBackend {
         Ok(())
     }
 
-    fn prop_list_mode(&self) -> PropListMode {
-        PropListMode::from_u8(self.prop_list_mode.load(Ordering::Relaxed))
-    }
-
-    /// Move to a mode that asks less of the device; never back up.
-    fn demote_prop_list(&self, mode: PropListMode) {
-        self.prop_list_mode.fetch_max(mode as u8, Ordering::Relaxed);
-    }
-
-    /// One `GetObjectPropList` request for `parent` and its children: `property`, or every
-    /// property with `None`.
+    /// One `GetObjectPropList` request for `property` of `parent` and its children.
     ///
     /// Only the device saying no (see [`is_all_handle_rejection`], split by
     /// [`is_prop_list_capability_decline`]) and a dataset we can't parse come back as answers;
@@ -348,11 +308,11 @@ impl UsbBackend {
     async fn ask_prop_list(
         &self,
         parent: PtpHandle,
-        property: Option<ObjectPropertyCode>,
+        property: ObjectPropertyCode,
     ) -> Result<PropListAnswer, PtpError> {
         match self
             .session
-            .get_object_prop_list(parent, None, property, 0, 1)
+            .get_object_prop_list(parent, None, Some(property), 0, 1)
             .await
         {
             Ok(data) => Ok(match ObjectPropListElement::list_from_bytes(&data) {
@@ -375,31 +335,8 @@ impl UsbBackend {
     }
 }
 
-/// How `GetObjectPropList` listings go on this session. Only ever moves down the list
-/// ([`UsbBackend::demote_prop_list`]), so no listing retries what an earlier one ruled out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum PropListMode {
-    /// Every property in one request.
-    All = 0,
-    /// "All" was declined or unusable: one request per property.
-    PerProperty = 1,
-    /// The device can't serve the required properties: list per handle.
-    Off = 2,
-}
-
-impl PropListMode {
-    fn from_u8(mode: u8) -> Self {
-        match mode {
-            0 => PropListMode::All,
-            1 => PropListMode::PerProperty,
-            _ => PropListMode::Off,
-        }
-    }
-}
-
-/// What a listing can't do without, asked first in the per-property mode. Their order sets the
-/// listing's order: objects keep the order they first appear in.
+/// What a listing can't do without, asked first. Their order sets the listing's order: objects
+/// keep the order they first appear in.
 ///
 /// `ObjectSize` is required of files only, since a folder's size means nothing (it reads 0).
 /// `StorageId` isn't asked: the listing's own storage stands in when an answer leaves it out.
@@ -1371,7 +1308,7 @@ mod tests {
     const SIZE: u16 = 0xDC04;
     const MODIFIED: u16 = 0xDC09;
     const CREATED: u16 = 0xDC08;
-    /// What the per-property mode asks, in order: what a listing can't do without, then dates.
+    /// What a listing asks, in order: what it can't do without, then dates.
     const PER_PROPERTY: [u16; 6] = [PARENT, NAME, FORMAT, SIZE, MODIFIED, CREATED];
     const REQUIRED: [u16; 4] = [PARENT, NAME, FORMAT, SIZE];
 
@@ -1435,14 +1372,6 @@ mod tests {
                 };
                 (handle, property, data_type, value)
             })
-            .collect()
-    }
-
-    /// Every property of [`answer`] in one dataset, as an "all properties" answer.
-    fn all_answer(children: &[(u32, &str)]) -> Vec<Element> {
-        PER_PROPERTY
-            .iter()
-            .flat_map(|&property| answer(property, children))
             .collect()
     }
 
@@ -1530,21 +1459,25 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let s = |v: &str| crate::ptp::pack_string(v);
-        // Depth 1 answers the folder itself (handle 5) and its children.
+        let u32v = |v: u32| pack_u32(v).to_vec();
+        // Depth 1 answers the folder itself (handle 5) and its children, one property at a time.
         device.prop_list(&[
-            (5, 0xDC07, 0xFFFF, s("DCIM")),
-            (5, 0xDC0B, 0x0006, pack_u32(0).to_vec()),
-            (10, 0xDC07, 0xFFFF, s("Camera")),
-            (10, 0xDC02, 0x0004, pack_u16(0x3001).to_vec()),
-            (10, 0xDC0B, 0x0006, pack_u32(5).to_vec()),
-            (11, 0xDC07, 0xFFFF, s("big.mp4")),
-            (11, 0xDC02, 0x0004, pack_u16(0x300B).to_vec()),
-            (11, 0xDC04, 0x0008, pack_u64(OVER_4GIB).to_vec()),
-            (11, 0xDC0B, 0x0006, pack_u32(5).to_vec()),
+            (5, PARENT, 0x0006, u32v(0)),
+            (10, PARENT, 0x0006, u32v(5)),
+            (11, PARENT, 0x0006, u32v(5)),
         ]);
-        // The answer has no dates, so each is asked on its own.
-        device.decline();
-        device.decline();
+        device.prop_list(&[
+            (5, NAME, 0xFFFF, s("DCIM")),
+            (10, NAME, 0xFFFF, s("Camera")),
+            (11, NAME, 0xFFFF, s("big.mp4")),
+        ]);
+        device.prop_list(&[
+            (10, FORMAT, 0x0004, pack_u16(0x3001).to_vec()),
+            (11, FORMAT, 0x0004, pack_u16(0x300B).to_vec()),
+        ]);
+        device.prop_list(&[(11, SIZE, 0x0008, pack_u64(OVER_4GIB).to_vec())]);
+        device.decline(); // DateModified
+        device.decline(); // DateCreated
 
         let backend = mock_backend_with_prop_list(transport).await;
         let objs = list_folder(&backend, None).await.unwrap();
@@ -1562,26 +1495,23 @@ mod tests {
             objs.iter().all(|o| o.storage_id == SID),
             "a StorageId the answer left out is the listed storage"
         );
-        // One request for all properties of the children, then the dates, and no GetObjectInfo.
+        // One request per property, never "all properties" (0xFFFFFFFF), and no GetObjectInfo.
+        let expected: Vec<Vec<u32>> = PER_PROPERTY
+            .iter()
+            .map(|&p| vec![5, 0, u32::from(p), 0, 1])
+            .collect();
         assert_eq!(
             command_params(&mock, OperationCode::GetObjectPropList),
-            [
-                vec![5, 0, 0xFFFF_FFFF, 0, 1],
-                vec![5, 0, u32::from(MODIFIED), 0, 1],
-                vec![5, 0, u32::from(CREATED), 0, 1],
-            ]
+            expected
         );
         assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
     }
 
     #[tokio::test]
-    async fn object_prop_list_declined_for_all_asks_one_property_at_a_time() {
+    async fn every_listing_asks_one_property_at_a_time() {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
-        // First listing: "all" declined (InvalidObjectPropCode), then one request per property.
-        device.decline();
         device.per_property(&PER_PROPERTY, &[(12, "a.jpg")]);
-        // Second listing: straight to the properties.
         device.per_property(&PER_PROPERTY, &[(12, "a.jpg")]);
 
         let backend = mock_backend_with_prop_list(transport).await;
@@ -1592,11 +1522,10 @@ mod tests {
             assert_eq!(objs[0].storage_id, SID);
             assert!(objs[0].modified.is_some() && objs[0].created.is_some());
         }
-        let requests = prop_list_requests(&mock);
-        let mut expected = vec![0xFFFF_FFFF];
-        expected.extend(per_property_requests(&PER_PROPERTY));
-        expected.extend(per_property_requests(&PER_PROPERTY));
-        assert_eq!(requests, expected, "\"all\" is asked once");
+        assert_eq!(
+            prop_list_requests(&mock),
+            per_property_requests(&[PER_PROPERTY, PER_PROPERTY].concat())
+        );
         assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
     }
 
@@ -1604,7 +1533,6 @@ mod tests {
     async fn the_listing_keeps_the_devices_order() {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
-        device.decline();
         // The first answer sets the order; later ones may list the same objects differently.
         device.prop_list(&answer(PARENT, &[(12, "b.jpg"), (11, "a.jpg")]));
         device.per_property(&PER_PROPERTY[1..], &[(11, "a.jpg"), (12, "b.jpg")]);
@@ -1619,7 +1547,6 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg"), (12, "b.jpg")];
-        device.decline();
         device.prop_list(&answer(PARENT, &children));
         device.decline(); // ObjectFileName
         device.per_handle(&children);
@@ -1633,7 +1560,7 @@ mod tests {
         }
         assert_eq!(
             prop_list_requests(&mock),
-            [0xFFFF_FFFF, u32::from(PARENT), u32::from(NAME)]
+            per_property_requests(&[PARENT, NAME])
         );
     }
 
@@ -1642,7 +1569,7 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         // Depth 1 answers only the folder itself...
-        device.prop_list(&all_answer(&[]));
+        device.per_property(&REQUIRED, &[]);
         // ...which the handle list confirms.
         device.per_handle(&[]);
 
@@ -1651,6 +1578,11 @@ mod tests {
         assert_eq!(
             command_params(&mock, OperationCode::GetObjectHandles).len(),
             1
+        );
+        assert_eq!(
+            prop_list_requests(&mock),
+            per_property_requests(&REQUIRED),
+            "no dates for nothing"
         );
     }
 
@@ -1661,7 +1593,7 @@ mod tests {
         // A device that answers depth 1 like depth 0 (the folder alone) reads as an empty
         // folder, which a file manager shows as "everything was deleted". The handle list
         // knows better.
-        device.prop_list(&all_answer(&[]));
+        device.per_property(&REQUIRED, &[]);
         device.per_handle(&[(11, "a.jpg")]);
 
         let backend = mock_backend_with_prop_list(transport).await;
@@ -1674,7 +1606,6 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg"), (12, "b.jpg")];
-        device.decline();
         // `ParentObject` answered for the folder alone: the device doesn't serve it.
         device.prop_list(&answer(PARENT, &[]));
         device.per_property(&REQUIRED[1..], &children);
@@ -1687,31 +1618,10 @@ mod tests {
             assert_eq!(names(&objs), ["a.jpg", "b.jpg"]);
         }
         assert_eq!(
-            prop_list_requests(&mock).len(),
-            1 + REQUIRED.len(),
+            prop_list_requests(&mock),
+            per_property_requests(&REQUIRED),
             "no prop list for the second listing, and no dates for the first"
         );
-    }
-
-    #[tokio::test]
-    async fn an_unusable_all_answer_retries_one_property_at_a_time() {
-        let (transport, mock) = mock_transport();
-        let mut device = Answers::new(&mock);
-        let children = [(11, "a.jpg"), (12, "b.jpg")];
-        // "All" answered, but without the children's parents.
-        let mut all = all_answer(&children);
-        all.retain(|&(handle, property, _, _)| !(property == PARENT && handle != FOLDER));
-        device.prop_list(&all);
-        device.per_property(&PER_PROPERTY, &children);
-        device.per_property(&PER_PROPERTY, &children);
-
-        let backend = mock_backend_with_prop_list(transport).await;
-        for _ in 0..2 {
-            let objs = list_folder(&backend, None).await.unwrap();
-            assert_eq!(names(&objs), ["a.jpg", "b.jpg"]);
-        }
-        assert_eq!(prop_list_requests(&mock).len(), 1 + 2 * PER_PROPERTY.len());
-        assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
     }
 
     #[tokio::test]
@@ -1719,7 +1629,6 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg"), (12, "b.jpg")];
-        device.decline();
         // An object that came or went between two per-property requests: one answer lacks it.
         device.prop_list(&answer(PARENT, &children));
         device.prop_list(&answer(NAME, &children[..1]));
@@ -1741,7 +1650,6 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg"), (12, "b.jpg")];
-        device.decline();
         // A depth-1 answer naming an object somewhere else: the device didn't answer what we
         // asked, so none of its answer is trusted.
         let mut parents = answer(PARENT, &children);
@@ -1756,7 +1664,7 @@ mod tests {
             let objs = list_folder(&backend, None).await.unwrap();
             assert_eq!(names(&objs), ["a.jpg", "b.jpg"]);
         }
-        assert_eq!(prop_list_requests(&mock).len(), 1 + REQUIRED.len());
+        assert_eq!(prop_list_requests(&mock), per_property_requests(&REQUIRED));
     }
 
     #[tokio::test]
@@ -1764,7 +1672,6 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg")];
-        device.decline();
         device.per_property(&PER_PROPERTY[..5], &children);
         device.decline(); // DateCreated
         device.per_property(&PER_PROPERTY[..5], &children);
@@ -1776,10 +1683,10 @@ mod tests {
             assert!(objs[0].modified.is_some());
             assert_eq!(objs[0].created, None);
         }
-        let mut expected = vec![0xFFFF_FFFF];
-        expected.extend(per_property_requests(&PER_PROPERTY));
-        expected.extend(per_property_requests(&PER_PROPERTY[..5]));
-        assert_eq!(prop_list_requests(&mock), expected);
+        assert_eq!(
+            prop_list_requests(&mock),
+            per_property_requests(&[&PER_PROPERTY[..], &PER_PROPERTY[..5]].concat())
+        );
         assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
     }
 
@@ -1792,80 +1699,26 @@ mod tests {
             .collect()
     }
 
-    /// An "all properties" answer without `left_out`.
-    fn all_answer_without(left_out: u16, children: &[(u32, &str)]) -> Vec<Element> {
-        let mut elements = all_answer(children);
-        elements.retain(|e| e.1 != left_out);
-        elements
-    }
-
     #[tokio::test]
-    async fn a_date_an_all_answer_left_out_is_asked_for_on_its_own() {
+    async fn a_date_served_for_nothing_is_not_asked_again() {
+        // Android answers DateCreated alone as Undefined for every object.
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg")];
-        for _ in 0..2 {
-            device.prop_list(&all_answer_without(CREATED, &children));
-            device.prop_list(&answer(CREATED, &children));
-        }
-
-        let backend = mock_backend_with_prop_list(transport).await;
-        for _ in 0..2 {
-            let objs = list_folder(&backend, None).await.unwrap();
-            assert_eq!(names(&objs), ["a.jpg"]);
-            assert!(objs[0].modified.is_some());
-            assert!(
-                objs[0].created.is_some(),
-                "the date the device serves on its own"
-            );
-        }
-        let ask = [0xFFFF_FFFF, u32::from(CREATED)];
-        assert_eq!(prop_list_requests(&mock), [ask, ask].concat());
-        assert!(command_params(&mock, OperationCode::GetObjectInfo).is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_date_the_device_serves_for_nothing_is_not_asked_again() {
-        // Android: "all" has no DateCreated, and asked alone it comes back Undefined.
-        let (transport, mock) = mock_transport();
-        let mut device = Answers::new(&mock);
-        let children = [(11, "a.jpg")];
-        device.prop_list(&all_answer_without(CREATED, &children));
+        device.per_property(&PER_PROPERTY[..5], &children);
         device.prop_list(&undefined_answer(CREATED, &children));
-        device.prop_list(&all_answer_without(CREATED, &children));
+        device.per_property(&PER_PROPERTY[..5], &children);
 
         let backend = mock_backend_with_prop_list(transport).await;
         for _ in 0..2 {
             let objs = list_folder(&backend, None).await.unwrap();
-            assert_eq!(names(&objs), ["a.jpg"]);
             assert!(objs[0].modified.is_some());
             assert_eq!(objs[0].created, None);
         }
         assert_eq!(
             prop_list_requests(&mock),
-            [0xFFFF_FFFF, u32::from(CREATED), 0xFFFF_FFFF]
+            per_property_requests(&[&PER_PROPERTY[..], &PER_PROPERTY[..5]].concat())
         );
-    }
-
-    #[tokio::test]
-    async fn a_date_served_for_nothing_per_property_is_not_asked_again() {
-        let (transport, mock) = mock_transport();
-        let mut device = Answers::new(&mock);
-        let children = [(11, "a.jpg")];
-        device.decline();
-        device.per_property(&PER_PROPERTY[..5], &children);
-        device.prop_list(&undefined_answer(CREATED, &children));
-        device.per_property(&PER_PROPERTY[..5], &children);
-
-        let backend = mock_backend_with_prop_list(transport).await;
-        for _ in 0..2 {
-            let objs = list_folder(&backend, None).await.unwrap();
-            assert_eq!(objs[0].created, None);
-        }
-        let mut expected = vec![0xFFFF_FFFF];
-        expected.extend(per_property_requests(&PER_PROPERTY));
-        expected.extend(per_property_requests(&PER_PROPERTY[..5]));
-        assert_eq!(prop_list_requests(&mock), expected);
     }
 
     #[tokio::test]
@@ -1884,7 +1737,7 @@ mod tests {
             let children = [(11, "a.jpg")];
             device.refuse(code);
             device.per_handle(&children);
-            device.prop_list(&all_answer(&children));
+            device.per_property(&PER_PROPERTY, &children);
 
             let backend = mock_backend_with_prop_list(transport).await;
             for _ in 0..2 {
@@ -1893,18 +1746,17 @@ mod tests {
             }
             assert_eq!(
                 prop_list_requests(&mock),
-                [0xFFFF_FFFF, 0xFFFF_FFFF],
-                "{code:?}: \"all\" is asked again"
+                per_property_requests(&[&[PARENT][..], &PER_PROPERTY[..]].concat()),
+                "{code:?}: the next listing asks again"
             );
         }
     }
 
     #[tokio::test]
-    async fn a_folder_refusing_a_required_property_keeps_the_per_property_mode() {
+    async fn a_folder_refusing_a_required_property_keeps_prop_list_on() {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg")];
-        device.decline();
         device.per_property(&PER_PROPERTY[..1], &children);
         device.refuse(ResponseCode::GeneralError); // ObjectFileName, for this folder only
         device.per_handle(&children);
@@ -1915,10 +1767,10 @@ mod tests {
             let objs = list_folder(&backend, None).await.unwrap();
             assert_eq!(names(&objs), ["a.jpg"]);
         }
-        let mut expected = vec![0xFFFF_FFFF];
-        expected.extend(per_property_requests(&PER_PROPERTY[..2]));
-        expected.extend(per_property_requests(&PER_PROPERTY));
-        assert_eq!(prop_list_requests(&mock), expected);
+        assert_eq!(
+            prop_list_requests(&mock),
+            per_property_requests(&[&PER_PROPERTY[..2], &PER_PROPERTY[..]].concat())
+        );
     }
 
     #[tokio::test]
@@ -1926,44 +1778,47 @@ mod tests {
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
         let children = [(11, "a.jpg")];
-        device.prop_list(&all_answer_without(CREATED, &children));
+        device.per_property(&PER_PROPERTY[..5], &children);
         device.refuse(ResponseCode::GeneralError);
-        device.prop_list(&all_answer_without(CREATED, &children));
-        device.prop_list(&answer(CREATED, &children));
+        device.per_property(&PER_PROPERTY, &children);
 
         let backend = mock_backend_with_prop_list(transport).await;
         let first = list_folder(&backend, None).await.unwrap();
         assert_eq!(first[0].created, None);
         let second = list_folder(&backend, None).await.unwrap();
         assert!(second[0].created.is_some());
-        let ask = [0xFFFF_FFFF, u32::from(CREATED)];
-        assert_eq!(prop_list_requests(&mock), [ask, ask].concat());
+        assert_eq!(
+            prop_list_requests(&mock),
+            per_property_requests(&[PER_PROPERTY, PER_PROPERTY].concat())
+        );
     }
 
     #[tokio::test]
-    async fn capability_declines_stick_for_the_session() {
+    async fn capability_declines_turn_prop_list_off_for_the_session() {
         for code in [0x2005, 0x2006, 0xA801, 0xA802, 0xA807, 0xA808] {
             let (transport, mock) = mock_transport();
             let mut device = Answers::new(&mock);
             let children = [(11, "a.jpg")];
             device.refuse(ResponseCode::from(code));
-            device.per_property(&PER_PROPERTY, &children);
-            device.per_property(&PER_PROPERTY, &children);
+            device.per_handle(&children);
+            device.per_handle(&children);
 
             let backend = mock_backend_with_prop_list(transport).await;
             for _ in 0..2 {
-                list_folder(&backend, None).await.unwrap();
+                let objs = list_folder(&backend, None).await.unwrap();
+                assert_eq!(names(&objs), ["a.jpg"], "{code:#06x}");
             }
-            let mut expected = vec![0xFFFF_FFFF];
-            expected.extend(per_property_requests(&PER_PROPERTY));
-            expected.extend(per_property_requests(&PER_PROPERTY));
-            assert_eq!(prop_list_requests(&mock), expected, "{code:#06x}");
+            assert_eq!(
+                prop_list_requests(&mock),
+                per_property_requests(&[PARENT]),
+                "{code:#06x}"
+            );
         }
     }
 
     #[tokio::test]
     async fn a_failing_session_propagates_instead_of_listing_per_handle() {
-        // Nothing answers: the transport fails under the "all" request.
+        // Nothing answers: the transport fails under the first request.
         let (transport, mock) = mock_transport();
         mock.queue_response(ok_response(0));
         let backend = mock_backend_with_prop_list(transport).await;
@@ -1974,7 +1829,6 @@ mod tests {
         // as `InvalidData` like an unparseable dataset does, but must not be mistaken for one.
         let (transport, mock) = mock_transport();
         let mut device = Answers::new(&mock);
-        device.decline();
         device.prop_list(&answer(PARENT, &[(11, "a.jpg")]));
         mock.queue_response(ok_response(1));
         let backend = mock_backend_with_prop_list(transport).await;
@@ -2027,7 +1881,6 @@ mod tests {
     async fn a_cancel_between_property_requests_stops_the_listing() {
         let mock = Arc::new(MockTransport::new());
         let mut device = Answers::new(&mock);
-        device.decline();
         device.per_property(&PER_PROPERTY, &[(11, "a.jpg")]);
         let token = CancelToken::new();
         let transport = Arc::new(CancelAfterPropLists {
@@ -2042,7 +1895,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
         assert_eq!(
             prop_list_requests(&mock),
-            [0xFFFF_FFFF, u32::from(PARENT)],
+            per_property_requests(&[PARENT, NAME]),
             "nothing after the cancel"
         );
         assert!(command_params(&mock, OperationCode::GetObjectHandles).is_empty());
